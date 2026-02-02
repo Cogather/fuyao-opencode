@@ -1,0 +1,11 @@
+# Python 平台服务依赖
+fastapi>=0.109.0
+uvicorn>=0.27.0
+pydantic>=2.5.0
+httpx>=0.26.0
+
+# MCP Server（可选）
+mcp>=1.0.0
+
+# 你的 Agent SDK（示例）
+# my-agent-sdk>=1.0.0

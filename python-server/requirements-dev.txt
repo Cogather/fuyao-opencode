@@ -1,0 +1,2 @@
+# 开发依赖（打包 exe 用）
+pyinstaller>=6.0.0

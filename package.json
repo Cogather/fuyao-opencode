@@ -1,0 +1,50 @@
+{
+  "name": "fuyao-opencode",
+  "version": "1.0.0",
+  "description": "扶摇 Agent 平台 OpenCode 插件（支持 Python SDK 本地运行）",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "files": [
+    "dist",
+    "python-server",
+    "bin"
+  ],
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target bun && bun run build:types",
+    "build:types": "tsc --emitDeclarationOnly --declaration --outDir dist",
+    "dev": "bun run src/index.ts",
+    "prepublishOnly": "bun run build",
+    "postinstall": "node bin/postinstall.js"
+  },
+  "bin": {
+    "fuyao-server": "bin/cli.js"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "latest"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "zod": "^3.23.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "agent",
+    "ai",
+    "python"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-org/my-agent-platform-plugin"
+  },
+  "license": "MIT",
+  "author": "Your Name"
+}
