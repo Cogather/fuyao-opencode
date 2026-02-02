@@ -1,0 +1,2 @@
+# fuyao-opencode
+扶摇Agent平台以插件形式集成至opencode使用能力穿刺
