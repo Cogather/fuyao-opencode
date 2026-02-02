@@ -623,6 +623,82 @@ const result: Record<string, Info> = {
 | `subagent` | 子 Agent | 只能被其他 Agent 调用（Task 工具） |
 | `all` | 全模式 | 两种场景都支持 |
 
+### 4.4 统一运行时架构
+
+**核心设计**：OpenCode 使用**统一的运行时**执行所有 Agent，Agent 本身只是一组配置参数，而非独立的执行引擎。
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    统一运行时 (SessionPrompt.loop)              │
+├────────────────────────────────────────────────────────────────┤
+│  ┌──────────────────┐                                          │
+│  │  Agent 配置加载   │  ← 动态加载 name, prompt, permission     │
+│  └────────┬─────────┘                                          │
+│           ↓                                                    │
+│  ┌──────────────────┐                                          │
+│  │  工具列表过滤     │  ← 根据 permission 过滤可用工具          │
+│  └────────┬─────────┘                                          │
+│           ↓                                                    │
+│  ┌──────────────────┐                                          │
+│  │  提示词组装       │  ← 模型提示词 + Agent.prompt + 环境信息   │
+│  └────────┬─────────┘                                          │
+│           ↓                                                    │
+│  ┌──────────────────┐                                          │
+│  │  LLM 调用        │  ← 使用 Agent.model 或默认模型            │
+│  └────────┬─────────┘                                          │
+│           ↓                                                    │
+│  ┌──────────────────┐                                          │
+│  │  工具执行        │  ← 统一的工具执行框架                     │
+│  └──────────────────┘                                          │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**运行时核心代码**：
+
+```typescript
+// packages/opencode/src/session/prompt.ts
+export const loop = fn(Identifier.schema("session"), async (sessionID) => {
+  while (true) {
+    // 1. 获取当前 Agent 配置（只是配置，不是运行时）
+    const agent = await Agent.get(lastUser.agent)
+    
+    // 2. 根据 Agent 配置解析可用工具列表
+    const tools = await resolveTools({
+      agent,        // Agent 配置决定哪些工具可用
+      session,
+      model,
+      processor,
+      messages: msgs,
+    })
+    
+    // 3. 组装系统提示（统一逻辑 + Agent 专用 prompt）
+    const result = await processor.process({
+      system: [
+        ...await SystemPrompt.environment(model),  // 环境信息
+        ...await InstructionPrompt.system(),       // 指令文件
+      ],
+      tools,    // 根据权限过滤后的工具
+      model,    // Agent.model 或默认模型
+      agent,    // Agent 配置
+    })
+  }
+})
+```
+
+**关键理解**：
+
+| 概念 | 说明 |
+|------|------|
+| **统一运行时** | `SessionPrompt.loop` 是唯一的执行引擎，所有 Agent 共用 |
+| **Agent 是配置** | Agent 只定义：prompt、model、permission、temperature 等参数 |
+| **动态加载** | 运行时根据 Agent 配置动态决定工具列表、模型、提示词 |
+| **权限驱动** | Agent 之间的主要差异在于工具权限，而非执行逻辑 |
+
+**这意味着**：
+- 创建新 Agent 只需定义配置，无需编写执行逻辑
+- 插件可以通过 `config` hook 动态注入 Agent 配置
+- 所有 Agent 共享相同的工具执行框架和消息处理流程
+
 ---
 
 ## 5. 工具系统
@@ -1526,6 +1602,372 @@ export function createConfigHandler(deps: ConfigHandlerDeps) {
 }
 ```
 
+### 12.4 插件集成与生效机制
+
+**oh-my-opencode 是如何被 OpenCode 加载并生效的？**
+
+#### 12.4.1 安装与加载流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        oh-my-opencode 集成流程                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  1. 用户配置 opencode.jsonc                                              │
+│     ┌────────────────────────────────────────────┐                      │
+│     │ {                                          │                      │
+│     │   "plugin": ["oh-my-opencode@latest"]      │  ← 声明插件依赖       │
+│     │ }                                          │                      │
+│     └────────────────────────────────────────────┘                      │
+│                         │                                               │
+│                         ▼                                               │
+│  2. OpenCode 启动时加载插件                                               │
+│     ┌────────────────────────────────────────────┐                      │
+│     │ // packages/opencode/src/plugin/index.ts   │                      │
+│     │ for (let plugin of plugins) {              │                      │
+│     │   // npm 包自动安装                         │                      │
+│     │   plugin = await BunProc.install(pkg, ver) │  ← 自动 npm install  │
+│     │   const mod = await import(plugin)         │  ← 动态导入          │
+│     │   const init = await fn(input)             │  ← 调用插件函数       │
+│     │   hooks.push(init)                         │  ← 收集 Hooks        │
+│     │ }                                          │                      │
+│     └────────────────────────────────────────────┘                      │
+│                         │                                               │
+│                         ▼                                               │
+│  3. 插件返回 Hooks 对象                                                   │
+│     ┌────────────────────────────────────────────┐                      │
+│     │ return {                                   │                      │
+│     │   tool: { ... },      // 注册工具          │                      │
+│     │   config: fn,         // 修改配置          │                      │
+│     │   event: fn,          // 监听事件          │                      │
+│     │   "chat.message": fn, // 处理消息          │                      │
+│     │   "tool.execute.before": fn,              │                      │
+│     │   "tool.execute.after": fn,               │                      │
+│     │ }                                          │                      │
+│     └────────────────────────────────────────────┘                      │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 12.4.2 各 Hook 生效时机
+
+oh-my-opencode 通过多个 Hook 介入 OpenCode 的运行：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          Hook 触发时机图                                 │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  用户发送消息                                                            │
+│       │                                                                 │
+│       ▼                                                                 │
+│  ┌─────────────────┐                                                    │
+│  │ chat.message    │  ← oh-my-opencode 检测 @关键词、自动斜杠命令        │
+│  │ Hook            │     keywordDetector, autoSlashCommand              │
+│  └────────┬────────┘                                                    │
+│           │                                                             │
+│           ▼                                                             │
+│  ┌─────────────────┐                                                    │
+│  │ config Hook     │  ← oh-my-opencode 注入 Agent、MCP、Command          │
+│  │ (初始化时触发)   │     configHandler: 注入 sisyphus 等 Agent          │
+│  └────────┬────────┘                                                    │
+│           │                                                             │
+│           ▼                                                             │
+│  ┌─────────────────┐                                                    │
+│  │ Agent.get()     │  ← 获取 sisyphus Agent 配置                         │
+│  │ 加载 Agent 配置  │     (由 config hook 注入)                          │
+│  └────────┬────────┘                                                    │
+│           │                                                             │
+│           ▼                                                             │
+│  ┌─────────────────┐                                                    │
+│  │ resolveTools()  │  ← 合并内置工具 + oh-my-opencode 注册的工具         │
+│  │ 解析可用工具     │     call_omo_agent, delegate_task, skill 等        │
+│  └────────┬────────┘                                                    │
+│           │                                                             │
+│           ▼                                                             │
+│  ┌─────────────────┐                                                    │
+│  │ LLM 推理        │  ← 使用 sisyphus Agent 的 prompt 和 model          │
+│  │ (SessionPrompt) │                                                    │
+│  └────────┬────────┘                                                    │
+│           │                                                             │
+│           ▼  LLM 决定调用工具                                            │
+│  ┌─────────────────┐                                                    │
+│  │ tool.execute    │  ← oh-my-opencode 注入规则、目录 Agent              │
+│  │ .before Hook    │     rulesInjector, directoryAgentsInjector         │
+│  └────────┬────────┘                                                    │
+│           │                                                             │
+│           ▼                                                             │
+│  ┌─────────────────┐                                                    │
+│  │ 工具执行        │  ← 可能是 oh-my-opencode 的工具                     │
+│  │ (内置或插件)    │     如 call_omo_agent, delegate_task               │
+│  └────────┬────────┘                                                    │
+│           │                                                             │
+│           ▼                                                             │
+│  ┌─────────────────┐                                                    │
+│  │ tool.execute    │  ← oh-my-opencode 截断输出、检查注释               │
+│  │ .after Hook     │     toolOutputTruncator, commentChecker            │
+│  └────────┬────────┘                                                    │
+│           │                                                             │
+│           ▼                                                             │
+│  ┌─────────────────┐                                                    │
+│  │ event Hook      │  ← oh-my-opencode 监听会话事件                      │
+│  │ (事件总线)      │     sessionNotification, sessionRecovery           │
+│  └─────────────────┘                                                    │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 12.4.3 关键集成点详解
+
+**1. config Hook - Agent 注入**
+
+这是 oh-my-opencode 最核心的集成点，通过修改配置对象注入自定义 Agent：
+
+```typescript
+// oh-my-opencode 的 config hook 做了什么
+config: async (config) => {
+  // 注入 Agent（这些 Agent 会出现在 Agent.list() 中）
+  config.agent = {
+    sisyphus: { name: "sisyphus", prompt: "...", mode: "primary" },
+    prometheus: { name: "prometheus", prompt: "...", mode: "primary" },
+    // ...
+  };
+  
+  // 设置默认 Agent（用户启动时默认使用 sisyphus）
+  config.default_agent = "sisyphus";
+  
+  // 注入 MCP 服务器
+  config.mcp = { /* ... */ };
+  
+  // 注入斜杠命令
+  config.command = { /* ... */ };
+}
+```
+
+#### 12.4.4 Agent 调用的实际原理（重要）
+
+> **核心理解**：oh-my-opencode 注入的 Agent（sisyphus、prometheus 等）**只是配置对象**，
+> **不是独立的执行体**。Agent 的实际执行由 OpenCode 的统一运行时完成。
+
+**Agent 调用流程解析**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│              oh-my-opencode Agent 调用原理                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  用户选择 Agent: "sisyphus"                                              │
+│       │                                                                 │
+│       ▼                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  Agent.get("sisyphus")                                          │   │
+│  │  返回的是一个配置对象：                                           │   │
+│  │  {                                                              │   │
+│  │    name: "sisyphus",                                            │   │
+│  │    prompt: "你是 Sisyphus，一个高级编程助手...",                  │   │
+│  │    model: { providerID: "anthropic", modelID: "claude-..." },   │   │
+│  │    permission: { edit: "allow", bash: "allow", ... },           │   │
+│  │    mode: "primary",                                             │   │
+│  │  }                                                              │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│       │                                                                 │
+│       │  这只是配置！不是可执行代码！                                     │
+│       ▼                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────┐   │
+│  │  OpenCode 统一运行时 (SessionPrompt.loop)                        │   │
+│  │                                                                 │   │
+│  │  // packages/opencode/src/session/prompt.ts                     │   │
+│  │  export const loop = fn(Identifier.schema("session"), async (sessionID) => {
+│  │    while (true) {                                               │   │
+│  │      const agent = await Agent.get(lastUser.agent)  // 获取配置  │   │
+│  │                                                                 │   │
+│  │      // 根据 Agent 配置组装系统提示词                             │   │
+│  │      const system = [                                           │   │
+│  │        ...await SystemPrompt.environment(model),                │   │
+│  │        ...await InstructionPrompt.system(),                     │   │
+│  │        agent.prompt,  // ← sisyphus 的 prompt 被插入这里          │   │
+│  │      ]                                                          │   │
+│  │                                                                 │   │
+│  │      // 根据 Agent 权限过滤可用工具                               │   │
+│  │      const tools = await resolveTools({                         │   │
+│  │        agent,  // ← sisyphus 的 permission 用于过滤工具           │   │
+│  │        session, model, processor, messages                      │   │
+│  │      })                                                         │   │
+│  │                                                                 │   │
+│  │      // 调用 LLM（使用 Agent 指定的 model）                       │   │
+│  │      const result = await processor.process({                   │   │
+│  │        system,                                                  │   │
+│  │        messages,                                                │   │
+│  │        tools,                                                   │   │
+│  │        model: agent.model ?? defaultModel,  // ← 使用配置的模型  │   │
+│  │        agent,                                                   │   │
+│  │      })                                                         │   │
+│  │                                                                 │   │
+│  │      // 执行工具（由 OpenCode 执行，不是 sisyphus 执行）           │   │
+│  │      for (const toolCall of result.toolCalls) {                 │   │
+│  │        await Tool.execute(toolCall)  // OpenCode 的工具执行      │   │
+│  │      }                                                          │   │
+│  │    }                                                            │   │
+│  │  })                                                             │   │
+│  └─────────────────────────────────────────────────────────────────┘   │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+**关键结论**：
+
+| 方面 | 说明 |
+|------|------|
+| **Agent 本质** | 配置对象（prompt + model + permission），不是执行代码 |
+| **执行主体** | OpenCode 的 `SessionPrompt.loop`，不是 Agent 本身 |
+| **prompt 作用** | 被插入到系统提示词中，影响 LLM 的行为风格 |
+| **permission 作用** | 用于过滤可用工具列表，控制 Agent 能做什么 |
+| **model 作用** | 指定使用的 LLM 模型，可选 |
+| **工具执行** | 由 OpenCode 统一执行，Agent 只是决定哪些工具可用 |
+
+**sisyphus 与 build 的区别**：
+
+```typescript
+// 内置 Agent: build
+{
+  name: "build",
+  prompt: "You are an expert software engineer...",
+  permission: { edit: "allow", bash: "allow" },
+  mode: "primary",
+}
+
+// oh-my-opencode Agent: sisyphus  
+{
+  name: "sisyphus",
+  prompt: "你是 Sisyphus，一个永不放弃的编程助手...", // 不同的提示词
+  permission: { edit: "allow", bash: "allow", mcp: "allow" }, // 可能有更多权限
+  mode: "primary",
+  // 可能指定不同的 model
+}
+
+// 它们的区别只在配置，执行逻辑完全一样：
+// 都是 SessionPrompt.loop 读取配置 → 组装 prompt → 调用 LLM → 执行工具
+```
+
+**为什么不是独立运行态？**
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│  oh-my-opencode 的 sisyphus 不是独立运行态                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ❌ sisyphus 没有自己的执行循环                                          │
+│  ❌ sisyphus 没有自己的工具调用逻辑                                       │
+│  ❌ sisyphus 没有自己的上下文管理                                         │
+│  ❌ sisyphus 没有自己的子 Agent 调度                                      │
+│                                                                         │
+│  ✅ sisyphus 只是告诉 OpenCode：                                         │
+│     - 用这个 prompt 去引导 LLM                                          │
+│     - 允许 LLM 使用这些工具                                              │
+│     - （可选）用这个特定的模型                                           │
+│                                                                         │
+│  ✅ 所有实际工作由 OpenCode 完成：                                        │
+│     - SessionPrompt.loop 执行对话循环                                   │
+│     - Tool.execute() 执行工具                                           │
+│     - ContextManager 管理上下文                                         │
+│     - Task 工具处理子任务                                                │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+这种设计的**优点**是插件开发简单，只需定义配置即可获得功能强大的 Agent。**缺点**是无法
+完全自定义执行逻辑。如果需要自定义运行态，需要开发带有独立后端服务的插件。
+
+#### 12.4.5 工具注册机制
+
+插件返回的 `tool` 对象会被合并到工具注册表：
+
+```typescript
+// OpenCode 如何合并插件工具
+// packages/opencode/src/tool/registry.ts
+export async function tools(model, agent) {
+  const result = [...BUILTIN_TOOLS]  // 内置工具
+  
+  // 合并插件注册的工具
+  const pluginTools = await Plugin.trigger("tool", {}, {})
+  for (const [id, definition] of Object.entries(pluginTools)) {
+    result.push({ id, ...definition })
+  }
+  
+  // 根据 Agent 权限过滤
+  return result.filter(tool => hasPermission(agent, tool.id))
+}
+```
+
+#### 12.4.6 事件监听机制
+
+oh-my-opencode 监听 OpenCode 事件总线，实现会话恢复、通知等功能：
+
+```typescript
+event: async (input) => {
+  // input.type 可能是：
+  // - "session.created"
+  // - "session.updated"
+  // - "message.created"
+  // - "message.updated"
+  // - "tool.executing"
+  // - "tool.completed"
+  
+  await sessionRecovery?.event(input);    // 会话恢复
+  await sessionNotification?.event(input); // 会话通知
+}
+```
+
+#### 12.4.7 生效验证
+
+安装 oh-my-opencode 后，可以通过以下方式验证是否生效：
+
+| 验证项 | 方法 |
+|--------|------|
+| Agent 注入成功 | 启动 OpenCode，检查 Agent 列表是否包含 `sisyphus` |
+| 工具注册成功 | 在对话中让 AI 列出可用工具，检查是否包含 `call_omo_agent` |
+| 默认 Agent | 检查新会话是否默认使用 `sisyphus` 而非 `build` |
+| Hook 生效 | 在消息中输入 `@omo` 等关键词，检查是否触发特殊行为 |
+
+#### 12.4.8 完整数据流
+
+```
+opencode.jsonc                    OpenCode 核心                   oh-my-opencode
+     │                                 │                               │
+     │  "plugin": ["oh-my-opencode"]   │                               │
+     └─────────────────────────────────▶                               │
+                                       │  BunProc.install()            │
+                                       │  import("oh-my-opencode")     │
+                                       ├──────────────────────────────▶│
+                                       │                               │
+                                       │         PluginInput           │
+                                       │  { client, directory, ... }   │
+                                       ├──────────────────────────────▶│
+                                       │                               │
+                                       │         返回 Hooks            │
+                                       │  { tool, config, event, ... } │
+                                       │◀──────────────────────────────┤
+                                       │                               │
+                                       │  触发 config hook             │
+                                       ├──────────────────────────────▶│
+                                       │                               │
+                                       │  修改 config 对象             │
+                                       │  注入 Agent、MCP、Command      │
+                                       │◀──────────────────────────────┤
+                                       │                               │
+                                       │  运行时触发各种 Hook           │
+                                       │  chat.message                 │
+                                       │  tool.execute.before/after    │
+                                       │  event                        │
+                                       ├─────────────────────────────▶│
+                                       │                               │
+                                       │  调用插件注册的工具            │
+                                       │  call_omo_agent               │
+                                       │  delegate_task                │
+                                       ├──────────────────────────────▶│
+                                       │                               │
+```
+
 ---
 
 # 第三部分：扩展机制指南
@@ -2254,6 +2696,38 @@ OpenCode 支持两种方式对接自定义 Agent 市场：
 |------|---------|---------|---------|
 | 直接配置 | 否 | 否 | 固定的 Agent 列表 |
 | 插件扩展 | 否 | 是 | 动态 Agent 市场 |
+
+> **重要说明**：无论是直接配置还是插件扩展方式，**Agent 的运行态始终在 OpenCode 内部**。
+> 
+> 这两种方式的本质都是**向 OpenCode 注入 Agent 配置**（prompt、model、permission 等），
+> 实际的执行循环、工具调用、上下文管理都由 OpenCode 的统一运行时 `SessionPrompt.loop` 处理。
+> 
+> Agent 在这里只是**配置对象**，不是独立的执行体。**oh-my-opencode 也是如此**——它提供了
+> 丰富的 Agent（如 Prometheus、Atlas）和工具，但这些 Agent 的执行仍然由 OpenCode 控制。
+> 
+> 如果需要**完全自定义运行态**（如使用 Python SDK、自己的子 Agent 调度、自己的 MCP 对接），
+> 需要开发**带有独立后端服务的插件**，通过工具调用将执行转发到自己的服务。
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                  Agent 市场对接的本质                                   │
+├────────────────────────────────────────────────────────────────────────┤
+│                                                                        │
+│   ┌──────────────────┐                ┌──────────────────────────────┐│
+│   │  Agent 市场       │   config hook  │     OpenCode 统一运行时       ││
+│   │  (配置文件/插件)   │───────────────▶│    (SessionPrompt.loop)      ││
+│   └──────────────────┘                │                              ││
+│          │                            │  执行循环：                   ││
+│          │ 提供：                      │  1. 接收用户消息              ││
+│          │ • prompt (提示词)          │  2. 根据 Agent 配置组装 prompt ││
+│          │ • model (模型)             │  3. 调用 LLM                  ││
+│          │ • permission (权限)        │  4. 执行工具                  ││
+│          │ • color, hidden, ...       │  5. 管理上下文                ││
+│          ▼                            └──────────────────────────────┘│
+│   Agent = 配置，不是执行体                                              │
+│                                                                        │
+└────────────────────────────────────────────────────────────────────────┘
+```
 
 ### 19.2 直接对接（配置文件方式）
 

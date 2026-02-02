@@ -412,7 +412,377 @@ ${input.context.instructions}`);
 
 ---
 
-## 七、总结
+## 七、fuyao-opencode 与 oh-my-opencode 的本质区别
+
+在深入分析后，需要明确两者的本质区别，这直接决定了哪些能复用、哪些必须单独实现。
+
+### 7.1 运行态差异
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                     oh-my-opencode（配置注入方式）                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  oh-my-opencode           OpenCode 统一运行时                            │
+│       │                        │                                        │
+│       │  config hook           │                                        │
+│       │  注入 Agent 配置       ▼                                        │
+│       └──────────────────▶ SessionPrompt.loop                           │
+│                                │                                        │
+│  Agent 是配置对象：            │ 执行主体是 OpenCode：                    │
+│  - sisyphus.prompt            │ - 消息循环                              │
+│  - sisyphus.permission        │ - 工具执行                              │
+│  - sisyphus.model             │ - 上下文管理                            │
+│                               │ - 子任务调度（Task 工具）                │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    fuyao-opencode（独立运行态方式）                       │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  OpenCode                        fuyao Python 运行时                    │
+│       │                               │                                 │
+│       │  工具调用                     │                                 │
+│       │  run_platform_agent          │                                 │
+│       └─────────────────────────▶    │                                 │
+│                                      │ 执行主体是 Python：               │
+│  OpenCode 只是入口：                 │ - 自己的消息循环                  │
+│  - 接收用户输入                      │ - 自己的工具执行                  │
+│  - 展示结果                          │ - 自己的上下文管理                │
+│  - 注册桥接工具                      │ - 自己的子 Agent 调度             │
+│                                      │ - 自己的 MCP/Skill 系统          │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.2 关键差异总结
+
+| 维度 | oh-my-opencode | fuyao-opencode |
+|------|---------------|----------------|
+| **Agent 本质** | 配置对象（prompt + permission） | 独立执行体（Python 类） |
+| **执行主体** | OpenCode 的 `SessionPrompt.loop` | Python 后端服务 |
+| **工具执行** | OpenCode 内置工具系统 | 转发到 Python 执行 |
+| **子 Agent** | OpenCode 的 Task 工具 | Python 自己的调度 |
+| **上下文管理** | OpenCode 的 ContextManager | Python 自己实现 |
+| **MCP 对接** | OpenCode 的 MCP 机制 | Python 自己的 MCP Client |
+
+---
+
+## 八、fuyao-opencode 可复用的架构逻辑
+
+基于上述分析，以下是 fuyao-opencode **可以复用**的部分：
+
+### 8.1 ✅ 插件框架层（完全可复用）
+
+| 模块 | 说明 | 复用方式 |
+|------|------|---------|
+| **插件入口结构** | `index.ts` 返回 Hooks 对象的模式 | 直接参照 |
+| **config hook 模式** | 注入配置的方式 | 直接复用 |
+| **tool 注册模式** | 通过 `tool` 属性注册工具 | 直接复用 |
+| **event hook 模式** | 监听事件的方式 | 直接复用 |
+
+```typescript
+// fuyao-opencode 可以完全复用这个结构
+const FuyaoPlugin: Plugin = async (ctx) => {
+  return {
+    config: async (input, output) => { /* 注入配置 */ },
+    tool: { /* 注册桥接工具 */ },
+    event: async (input) => { /* 监听事件 */ },
+    "chat.message": async (input, output) => { /* 处理消息 */ },
+  };
+};
+```
+
+### 8.2 ✅ Hook 机制（可复用，但用途不同）
+
+| Hook | oh-my-opencode 用途 | fuyao-opencode 用途 |
+|------|---------------------|---------------------|
+| **keyword-detector** | 检测 `@omo` 切换 Agent | 检测 `@fuyao` 转发到后端 |
+| **rules-injector** | 给 sisyphus 注入规则 | 给 Python Agent 传递规则 |
+| **chat.message** | 修改消息、注入提示 | 识别意图、决定是否转发 |
+| **tool.execute.before** | 注入上下文 | 可用于日志、权限检查 |
+| **tool.execute.after** | 截断输出、检查注释 | 可用于结果处理 |
+
+### 8.3 ✅ 共享工具函数（完全可复用）
+
+```typescript
+// 这些无状态工具可以直接复用
+import { log } from "oh-my-opencode/src/shared/logger";
+import { deepMerge } from "oh-my-opencode/src/shared/deep-merge";
+import { DynamicTruncator } from "oh-my-opencode/src/shared/dynamic-truncator";
+import { parseFrontmatter } from "oh-my-opencode/src/shared/frontmatter";
+import { parseJSONC } from "oh-my-opencode/src/shared/jsonc-parser";
+```
+
+### 8.4 ✅ 配置管理模式（可参考）
+
+```typescript
+// oh-my-opencode 的配置加载模式可以参考
+// oh-my-opencode/src/plugin-config.ts
+export function loadPluginConfig(directory: string, ctx: PluginInput) {
+  // 1. 加载默认配置
+  // 2. 加载项目配置 (.opencode/config.jsonc)
+  // 3. 深度合并
+  // 4. 返回配置对象
+}
+
+// fuyao-opencode 可以用类似模式
+export function loadFuyaoConfig(directory: string) {
+  // 加载 .opencode/fuyao.jsonc 或环境变量
+}
+```
+
+---
+
+## 九、fuyao-opencode 可复用的价值实现
+
+### 9.1 ✅ LSP 工具（直接复用）
+
+LSP 工具不依赖运行态，可以直接复用：
+
+```typescript
+// fuyao-opencode 可以直接注册这些工具
+import {
+  lsp_goto_definition,
+  lsp_find_references,
+  lsp_rename,
+  lsp_document_symbols,
+} from "oh-my-opencode/src/tools/lsp/tools";
+
+// 这些工具在 OpenCode 中执行，Python 后端可以通过调用这些工具获取代码信息
+```
+
+### 9.2 ✅ 上下文收集（可复用思路）
+
+```typescript
+// oh-my-opencode 的上下文收集逻辑可以参考
+// features/context-injector/
+
+// fuyao-opencode 可以：
+// 1. 在 TypeScript 层收集上下文（文件列表、git 状态等）
+// 2. 通过 HTTP 传递给 Python 后端
+// 3. Python 后端基于上下文执行任务
+```
+
+### 9.3 ✅ 工具输出截断（可复用）
+
+```typescript
+// oh-my-opencode 的动态截断器
+import { DynamicTruncator } from "oh-my-opencode/src/shared/dynamic-truncator";
+
+// fuyao-opencode 可以用于：
+// 1. 截断 Python 返回的大量输出
+// 2. 截断文件读取结果
+const truncator = new DynamicTruncator({ maxLength: 10000 });
+const truncated = truncator.truncate(pythonOutput);
+```
+
+### 9.4 ✅ 关键词检测模式（可复用并扩展）
+
+```typescript
+// 参考 oh-my-opencode 的 keyword-detector
+// fuyao-opencode 可以检测自己的关键词
+"chat.message": async (input, output) => {
+  const text = extractText(output.parts);
+  
+  if (text.includes("@fuyao") || text.includes("@扶摇")) {
+    // 标记这个消息需要转发到 Python 后端
+    output.metadata = {
+      ...output.metadata,
+      fuyao_forward: true,
+    };
+  }
+}
+```
+
+### 9.5 ✅ Agent 定义模式（可参考 prompt 结构）
+
+```typescript
+// oh-my-opencode 的 Agent prompt 结构可以参考
+// 例如 agents/sisyphus.ts 的 prompt 组织方式
+
+// fuyao-opencode 可以用类似结构定义 Agent 配置
+// 然后传递给 Python 后端
+const FUYAO_CODER_PROMPT = `
+## 身份
+你是扶摇平台的代码专家...
+
+## 能力
+- 代码生成
+- 代码审查
+- ...
+
+## 约束
+- ...
+`;
+```
+
+---
+
+## 十、fuyao-opencode 必须单独实现的部分
+
+### 10.1 ❌ Agent 执行循环（必须自己实现）
+
+**原因**：fuyao-opencode 的 Agent 在 Python 后端执行，不能使用 OpenCode 的 `SessionPrompt.loop`。
+
+```python
+# fuyao-opencode/python-server/agent/loop.py
+class AgentExecutionLoop:
+    """fuyao 必须自己实现的执行循环"""
+    
+    async def run(self, task: str, context: dict):
+        while not self.is_complete:
+            # 1. 组装 prompt（自己实现）
+            prompt = self.build_prompt(task, context)
+            
+            # 2. 调用 LLM（自己实现）
+            response = await self.llm.chat(prompt)
+            
+            # 3. 解析工具调用（自己实现）
+            tool_calls = self.parse_tool_calls(response)
+            
+            # 4. 执行工具（自己实现）
+            for call in tool_calls:
+                result = await self.execute_tool(call)
+            
+            # 5. 管理上下文（自己实现）
+            self.context_manager.update(response, results)
+```
+
+### 10.2 ❌ 工具执行引擎（必须自己实现）
+
+**原因**：fuyao 的工具在 Python 中执行，不能使用 OpenCode 的 `Tool.execute()`。
+
+```python
+# fuyao-opencode/python-server/tools/executor.py
+class ToolExecutor:
+    """fuyao 必须自己实现的工具执行器"""
+    
+    def __init__(self):
+        self.tools = {
+            "read_file": ReadFileTool(),
+            "write_file": WriteFileTool(),
+            "run_command": RunCommandTool(),
+            # ... 自己的工具实现
+        }
+    
+    async def execute(self, tool_name: str, args: dict):
+        tool = self.tools.get(tool_name)
+        if not tool:
+            raise ToolNotFoundError(tool_name)
+        return await tool.execute(args)
+```
+
+### 10.3 ❌ 子 Agent 调度（必须自己实现）
+
+**原因**：oh-my-opencode 使用 OpenCode 的 Task 工具，fuyao 需要自己的调度逻辑。
+
+```python
+# fuyao-opencode/python-server/agent/scheduler.py
+class SubAgentScheduler:
+    """fuyao 必须自己实现的子 Agent 调度"""
+    
+    async def delegate(self, task: str, agent_id: str):
+        # 1. 获取子 Agent 配置
+        agent = self.get_agent(agent_id)
+        
+        # 2. 创建子执行上下文
+        sub_context = self.create_sub_context(task)
+        
+        # 3. 执行子 Agent（自己的执行循环）
+        result = await agent.run(task, sub_context)
+        
+        # 4. 返回结果给父 Agent
+        return result
+```
+
+### 10.4 ❌ MCP Client（必须自己实现）
+
+**原因**：fuyao 可能需要对接自己的 MCP Server，不能直接使用 OpenCode 的 MCP 机制。
+
+```python
+# fuyao-opencode/python-server/mcp/client.py
+class FuyaoMCPClient:
+    """fuyao 必须自己实现的 MCP Client"""
+    
+    async def call_tool(self, server: str, tool: str, args: dict):
+        # 通过 MCP 协议调用工具
+        pass
+    
+    async def get_resource(self, server: str, uri: str):
+        # 通过 MCP 协议获取资源
+        pass
+```
+
+### 10.5 ❌ 上下文/会话管理（必须自己实现）
+
+**原因**：fuyao 的会话状态在 Python 中维护。
+
+```python
+# fuyao-opencode/python-server/session/manager.py
+class SessionManager:
+    """fuyao 必须自己实现的会话管理"""
+    
+    def __init__(self):
+        self.sessions = {}
+    
+    def create_session(self, session_id: str):
+        self.sessions[session_id] = {
+            "messages": [],
+            "context": {},
+            "state": "active",
+        }
+    
+    def add_message(self, session_id: str, message: dict):
+        self.sessions[session_id]["messages"].append(message)
+    
+    def get_context(self, session_id: str):
+        return self.sessions[session_id]["context"]
+```
+
+### 10.6 ❌ Skill/知识库系统（必须自己实现）
+
+**原因**：fuyao 有自己的 Skill 和知识库系统。
+
+```python
+# fuyao-opencode/python-server/skill/loader.py
+class SkillLoader:
+    """fuyao 必须自己实现的 Skill 系统"""
+    
+    def load_skill(self, skill_id: str):
+        # 加载自己平台的 Skill
+        pass
+    
+    def execute_skill(self, skill_id: str, args: dict):
+        # 执行 Skill
+        pass
+```
+
+---
+
+## 十一、复用与自研对照表
+
+| 功能领域 | 可复用（TypeScript 层） | 必须自研（Python 层） |
+|----------|----------------------|---------------------|
+| **插件框架** | ✅ Hook 机制、配置注入 | - |
+| **工具注册** | ✅ tool 属性注册桥接工具 | ❌ 实际工具执行 |
+| **Agent 定义** | ✅ prompt 结构参考 | ❌ Agent 执行循环 |
+| **上下文收集** | ✅ 文件列表、git 状态 | ❌ 上下文管理、压缩 |
+| **关键词检测** | ✅ keyword-detector 模式 | - |
+| **LSP 工具** | ✅ 直接复用 | - |
+| **子 Agent** | - | ❌ 调度逻辑 |
+| **MCP 对接** | - | ❌ MCP Client |
+| **会话管理** | - | ❌ 会话状态 |
+| **Skill 系统** | - | ❌ Skill 加载/执行 |
+| **工具截断** | ✅ DynamicTruncator | - |
+| **日志/工具函数** | ✅ shared/* | - |
+
+---
+
+## 十二、总结
+
+### 复用策略
 
 | 复用策略 | 适用模块 | 方式 |
 |----------|----------|------|
@@ -421,10 +791,29 @@ ${input.context.instructions}`);
 | **参考设计** | 架构、prompt 构建、状态管理 | 学习其设计，自己实现 |
 | **不复用** | 和你的 SDK 冲突的模块 | 自己实现 |
 
-**核心原则**：
-1. 无状态的工具函数 → 直接复用
-2. 有状态但和你的 SDK 不冲突 → 可以复用
-3. 和你的 SDK 功能重叠 → 参考设计，自己实现
-4. 和你的 SDK 冲突 → 不复用
+### 核心原则
 
-这样你既能参考 oh-my-opencode 的成熟架构，又能保持你的插件独立性和可维护性。
+1. **TypeScript 层**：尽量复用 oh-my-opencode 的模式（Hook、配置、工具注册）
+2. **Python 层**：必须完全自研（执行循环、工具执行、子 Agent、MCP、会话管理）
+3. **桥接层**：TypeScript 工具负责接收请求、转发到 Python、返回结果
+
+### 架构建议
+
+```
+fuyao-opencode/
+├── src/                          # TypeScript 层（复用 oh-my-opencode 模式）
+│   ├── index.ts                  # 插件入口（✅ 复用模式）
+│   ├── hooks/                    # Hook 实现（✅ 可复用 keyword-detector 等）
+│   ├── tools/                    # 桥接工具（✅ 复用注册模式，❌ 执行转发到 Python）
+│   └── shared/                   # 工具函数（✅ 直接复用）
+│
+└── python-server/                # Python 层（必须自研）
+    ├── agent/                    # ❌ Agent 执行循环
+    ├── tools/                    # ❌ 工具执行引擎
+    ├── scheduler/                # ❌ 子 Agent 调度
+    ├── mcp/                      # ❌ MCP Client
+    ├── session/                  # ❌ 会话管理
+    └── skill/                    # ❌ Skill 系统
+```
+
+这样既能复用 oh-my-opencode 的成熟插件框架，又能保持 fuyao-opencode 的独立运行态优势。
