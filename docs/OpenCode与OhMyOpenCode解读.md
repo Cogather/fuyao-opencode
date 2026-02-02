@@ -1,25 +1,1036 @@
-# OpenCode 插件系统深度解读
+# OpenCode 源码深度解读
 
-本文详细解读 OpenCode 的插件机制，包含核心代码片段，帮助你理解如何开发自己的插件。
-
----
-
-## 一、核心概念
-
-| 概念 | 说明 |
-|------|------|
-| **Plugin** | 一个异步函数，接收 `PluginInput`，返回 `Hooks` 对象 |
-| **Hooks** | 插件能力的集合：config、tool、event、chat.message 等 |
-| **Tool** | 插件提供的工具，LLM 可以调用 |
-| **PluginInput** | OpenCode 传给插件的上下文（client、directory 等） |
+本文档基于 OpenCode 真实源码，全面解读其架构设计、核心机制和扩展方式。
 
 ---
 
-## 二、插件类型定义
+## 目录
 
-### 2.1 Plugin 类型
+### 第一部分：OpenCode 核心架构
+1. [项目概述](#1-项目概述)
+2. [核心数据模型](#2-核心数据模型) - Session、Message、Part、Event
+3. [配置系统](#3-配置系统) - 加载优先级、Schema
+4. [Agent 系统](#4-agent-系统) - 定义、内置 Agent、模式
+5. [工具系统](#5-工具系统) - 定义、内置工具
+6. [Provider 系统](#6-provider-系统) - LLM 集成架构
+7. [MCP 系统](#7-mcp-系统) - 配置类型、示例
+8. [HTTP Server](#8-http-server) - API 端点
 
-**文件位置**: `opencode-dev/packages/plugin/src/index.ts`
+### 第二部分：插件系统详解
+9. [插件类型定义](#9-插件类型定义) - PluginInput、Hooks
+10. [插件加载机制](#10-插件加载机制) - 加载流程、trigger
+11. [编写插件](#11-编写插件) - 示例、Hooks 触发时机
+12. [oh-my-opencode 案例分析](#12-oh-my-opencode-案例分析)
+
+### 第三部分：扩展机制指南
+13. [认证扩展](#13-认证扩展) - 用户账号、本地服务、Provider 认证
+14. [Provider 扩展](#14-provider-扩展) - 配置、自定义推理服务
+15. [Agent 扩展](#15-agent-扩展) - 配置文件、插件方式
+16. [工具扩展](#16-工具扩展) - 插件、.opencode/tool
+17. [MCP 扩展](#17-mcp-扩展) - 配置、插件方式
+18. [Codebase 对接](#18-codebase-对接) - 本地代码搜索、语义搜索
+19. [Agent 市场对接](#19-agent-市场对接) - 直接配置、插件扩展
+20. [源码修改位置汇总](#20-源码修改位置汇总)
+21. [关键源码文件索引](#21-关键源码文件索引)
+
+---
+
+# 第一部分：OpenCode 核心架构
+
+## 1. 项目概述
+
+OpenCode 是一个基于 AI 的代码助手，采用 TypeScript 开发，支持多种 LLM Provider，提供丰富的工具集和插件扩展能力。
+
+### 1.1 代码仓库结构
+
+```
+opencode-dev/
+├── packages/
+│   ├── opencode/           # 核心实现
+│   │   ├── src/
+│   │   │   ├── agent/      # Agent 系统
+│   │   │   ├── auth/       # 本地认证存储
+│   │   │   ├── config/     # 配置系统
+│   │   │   ├── mcp/        # MCP 协议支持
+│   │   │   ├── plugin/     # 插件加载机制
+│   │   │   ├── provider/   # LLM Provider 集成
+│   │   │   ├── server/     # HTTP Server (Hono)
+│   │   │   ├── session/    # 会话管理
+│   │   │   ├── tool/       # 工具系统
+│   │   │   ├── bus/        # 事件总线
+│   │   │   ├── permission/ # 权限系统
+│   │   │   ├── skill/      # 技能系统
+│   │   │   ├── lsp/        # LSP 语言服务
+│   │   │   ├── format/     # 代码格式化
+│   │   │   ├── file/       # 文件操作
+│   │   │   ├── snapshot/   # 快照系统
+│   │   │   ├── share/      # 分享功能
+│   │   │   └── util/       # 工具函数
+│   │   └── package.json
+│   ├── plugin/             # 插件 SDK（类型定义）
+│   │   ├── src/
+│   │   │   ├── index.ts    # Plugin、Hooks 类型
+│   │   │   ├── tool.ts     # Tool 定义辅助函数
+│   │   │   └── shell.ts    # BunShell 类型
+│   │   └── package.json
+│   ├── sdk/                # JavaScript SDK
+│   │   └── js/
+│   └── console/            # 云端控制台（opencode.ai）
+│       ├── app/            # 前端应用
+│       ├── core/           # 核心模型、数据库 Schema
+│       └── function/       # Serverless 函数（认证等）
+├── scripts/                # 构建脚本
+├── docs/                   # 文档
+└── .github/                # GitHub 配置
+```
+
+### 1.2 技术栈
+
+| 层级 | 技术选型 |
+|------|---------|
+| 运行时 | Bun |
+| 语言 | TypeScript |
+| HTTP Server | Hono |
+| Schema 验证 | Zod |
+| AI SDK | Vercel AI SDK |
+| 数据库 | Drizzle ORM + MySQL（云端） |
+| 认证 | OpenAuth（云端） |
+
+---
+
+## 2. 核心数据模型
+
+OpenCode 的数据模型采用 **Zod Schema** 定义，确保类型安全和运行时验证。理解这些核心模型是扩展 OpenCode 的基础。
+
+### 2.1 Session（会话）
+
+**源码位置**: `packages/opencode/src/session/`
+
+**设计理念**：Session 是 OpenCode 的顶级容器，代表一次完整的对话交互。每个 Session 可以：
+- 包含多条 Message（用户输入和 AI 回复）
+- 关联特定的 Agent、Model 和 Provider
+- 支持分支（parentID）实现对话树
+- 支持分享功能
+
+```typescript
+// packages/opencode/src/session/session.ts
+export namespace Session {
+  export const Info = z.object({
+    id: z.string(),                         // 唯一标识符，格式: session_xxx
+    title: z.string().optional(),           // 会话标题（自动生成或用户自定义）
+    parentID: z.string().optional(),        // 父会话 ID（用于分支/fork 功能）
+    share: z.string().optional(),           // 分享链接 URL
+    version: z.number().int(),              // 版本号（用于乐观锁更新）
+    updated: z.string().datetime(),         // 最后更新时间
+    created: z.string().datetime(),         // 创建时间
+    agentID: z.string().optional(),         // 当前使用的 Agent ID
+    modelID: z.string().optional(),         // 当前使用的模型 ID
+    providerID: z.string().optional(),      // 当前使用的 Provider ID
+  })
+  
+  // 会话持久化：存储在 ~/.local/share/opencode/session/
+}
+```
+
+**关键点解读**：
+- `parentID` 实现了对话分支功能，用户可以从任意消息点创建新分支
+- `version` 字段用于并发控制，防止多客户端同时修改
+- 会话数据以 JSON 文件形式存储在本地，支持离线访问
+
+### 2.2 Message（消息）
+
+**源码位置**: `packages/sdk/js/src/gen/core/`
+
+**设计理念**：Message 是对话的基本单元。OpenCode 采用 **流式处理** 架构，消息内容通过 Part 分块传输，支持实时显示 AI 的思考过程和工具调用。
+
+**消息角色说明**：
+- `user`: 用户输入的消息
+- `assistant`: AI 生成的回复
+- `system`: 系统消息（通常是 System Prompt）
+
+```typescript
+// 消息类型
+export const Message = z.object({
+  id: z.string(),                           // 消息唯一 ID
+  sessionID: z.string(),                    // 所属会话 ID
+  role: z.enum(["user", "assistant", "system"]),
+  variant: z.string().optional(),           // 消息变体（重试时保留原消息，创建新变体）
+  time: z.object({
+    created: z.string().datetime(),         // 消息创建时间
+    completed: z.string().datetime().optional(), // 消息完成时间（流式结束）
+  }),
+  tokens: z.object({                        // Token 使用统计
+    input: z.number().optional(),           // 输入 token 数
+    output: z.number().optional(),          // 输出 token 数
+    cache: z.object({                       // 缓存命中统计
+      read: z.number().optional(),          // 缓存读取 token 数
+      write: z.number().optional(),         // 缓存写入 token 数
+    }).optional(),
+  }).optional(),
+  model: z.object({                         // 使用的模型信息
+    providerID: z.string(),
+    modelID: z.string(),
+  }).optional(),
+  agent: z.string().optional(),             // 使用的 Agent ID
+})
+
+// 用户消息（继承基础 Message）
+export const UserMessage = Message.extend({
+  role: z.literal("user"),
+})
+
+// 助手消息
+export const AssistantMessage = Message.extend({
+  role: z.literal("assistant"),
+  system: z.string().optional(),           // System prompt
+  error: z.string().optional(),
+})
+```
+
+### 2.3 Part（消息内容块）
+
+**源码位置**: `packages/sdk/js/src/gen/core/part.gen.ts`
+
+**设计理念**：Part 是 OpenCode **流式架构** 的核心。一条 Message 由多个 Part 组成，每个 Part 代表一个独立的内容块。这种设计支持：
+- **实时流式显示**：AI 回复可以边生成边显示
+- **混合内容类型**：文本、代码、工具调用可以交错出现
+- **状态追踪**：工具调用有完整的状态机（pending → streaming → result/error）
+
+**Part 类型说明**：
+
+| 类型 | 用途 | 典型场景 |
+|------|------|---------|
+| `text` | 普通文本内容 | AI 的文字回复 |
+| `reasoning` | 思考过程 | Claude 的 thinking 模式 |
+| `tool-invocation` | 工具调用 | 执行 Edit、Bash 等工具 |
+| `step-start` | 步骤标记 | 多步推理的分隔 |
+| `file` | 文件附件 | 图片、文档上传 |
+
+```typescript
+// Part 使用 discriminatedUnion 实现类型安全的多态
+export const Part = z.discriminatedUnion("type", [
+  // 文本内容 - 最常见的 Part 类型
+  z.object({
+    type: z.literal("text"),
+    id: z.string(),
+    text: z.string(),
+  }),
+  
+  // 思考过程（Reasoning）- 用于展示 AI 的推理过程
+  z.object({
+    type: z.literal("reasoning"),
+    id: z.string(),
+    reasoning: z.string(),
+  }),
+  
+  // 工具调用 - OpenCode 的核心能力
+  z.object({
+    type: z.literal("tool-invocation"),
+    id: z.string(),
+    toolInvocation: z.object({
+      state: z.enum(["pending", "streaming", "result", "error"]),
+      step: z.number().optional(),        // 多步工具调用的步骤号
+      toolCallId: z.string(),             // LLM 生成的调用 ID
+      toolName: z.string(),               // 工具名称（如 edit、bash）
+      args: z.any(),                      // 工具参数
+      result: z.any().optional(),         // 执行结果
+    }),
+  }),
+  
+  // 步骤开始 - 标记新的推理步骤
+  z.object({
+    type: z.literal("step-start"),
+    id: z.string(),
+    step: z.number(),
+    time: z.string().datetime(),
+  }),
+  
+  // 文件附件 - 支持多模态输入
+  z.object({
+    type: z.literal("file"),
+    id: z.string(),
+    file: z.object({
+      name: z.string(),
+      mediaType: z.string(),              // MIME 类型
+      url: z.string().optional(),         // 文件 URL 或 base64
+    }),
+  }),
+])
+```
+
+**工具调用状态流转**：
+```
+pending → streaming → result (成功)
+                   ↘ error (失败)
+```
+
+### 2.4 Event（事件）
+
+**源码位置**: `packages/opencode/src/bus/`
+
+**设计理念**：OpenCode 采用 **事件驱动架构**，通过 Bus 实现组件间的解耦通信。插件可以订阅这些事件来响应系统状态变化。
+
+**事件系统特点**：
+- **发布-订阅模式**：组件之间不直接依赖，通过事件解耦
+- **类型安全**：每个事件都有 Zod Schema 定义的 payload
+- **支持通配符**：可以订阅 `*` 接收所有事件
+
+**核心事件分类**：
+
+| 事件类型 | 触发时机 | 插件应用场景 |
+|---------|---------|-------------|
+| `session.*` | 会话创建/更新/删除 | 会话统计、自动保存 |
+| `message.*` | 消息变化 | 日志记录、消息过滤 |
+| `message.part.*` | Part 流式更新 | 实时 UI 渲染 |
+| `tool.*` | 工具执行前后 | 审计日志、性能监控 |
+| `permission.*` | 权限请求/响应 | 自动审批、安全策略 |
+
+```typescript
+// OpenCode 事件系统
+export namespace Bus {
+  // ==================== Session 生命周期事件 ====================
+  export const SessionCreated = event("session.created", Session.Info)
+  export const SessionUpdated = event("session.updated", Session.Info)
+  export const SessionDeleted = event("session.deleted", z.object({ id: z.string() }))
+  
+  // ==================== Message 事件 ====================
+  export const MessageCreated = event("message.created", Message)
+  export const MessageUpdated = event("message.updated", Message)
+  export const MessagePartCreated = event("message.part.created", Part)  // 流式新 Part
+  export const MessagePartUpdated = event("message.part.updated", Part)  // Part 内容更新
+  
+  // ==================== Tool 执行事件 ====================
+  // 工具开始执行时触发，可用于日志、监控
+  export const ToolExecuting = event("tool.executing", z.object({
+    sessionID: z.string(),
+    messageID: z.string(),
+    toolName: z.string(),       // 如 "edit", "bash", "read"
+    toolCallId: z.string(),
+    args: z.any(),              // 工具参数
+  }))
+  
+  // 工具执行完成时触发，包含结果
+  export const ToolCompleted = event("tool.completed", z.object({
+    sessionID: z.string(),
+    messageID: z.string(),
+    toolName: z.string(),
+    toolCallId: z.string(),
+    result: z.any(),            // 执行结果或错误信息
+  }))
+  
+  // ==================== Permission 事件 ====================
+  export const PermissionRequested = event("permission.requested", Permission)
+  export const PermissionResponded = event("permission.responded", Permission)
+}
+```
+
+**插件中订阅事件示例**：
+```typescript
+event: async ({ event }) => {
+  if (event.type === "session.created") {
+    console.log("新会话创建:", event.properties.id);
+  }
+  if (event.type === "tool.completed") {
+    console.log(`工具 ${event.properties.toolName} 执行完成`);
+  }
+}
+```
+
+---
+
+## 3. 配置系统
+
+OpenCode 采用 **分层配置** 架构，支持从多个来源加载配置并智能合并。这种设计既支持企业统一管理，又允许用户和项目级别的定制。
+
+### 3.1 配置加载优先级
+
+**源码位置**: `packages/opencode/src/config/config.ts`
+
+**设计理念**：配置采用 **层叠覆盖** 策略，高优先级的配置会覆盖低优先级的同名字段。对于数组类型（如 `plugin`、`instructions`），则采用 **合并去重** 策略。
+
+```
+配置加载顺序（从低到高优先级）：
+
+┌─────────────────────────────────────────────────────────────┐
+│  7. 托管配置 (/etc/opencode/) - 企业管理员控制，最高优先级    │
+├─────────────────────────────────────────────────────────────┤
+│  6. 插件 config hook 修改 - 插件动态修改配置                 │
+├─────────────────────────────────────────────────────────────┤
+│  5. OPENCODE_CONFIG_CONTENT - 内联 JSON 配置                │
+├─────────────────────────────────────────────────────────────┤
+│  4. 项目配置 (./opencode.jsonc) - 项目级别定制              │
+├─────────────────────────────────────────────────────────────┤
+│  3. OPENCODE_CONFIG 环境变量 - 指定配置文件路径              │
+├─────────────────────────────────────────────────────────────┤
+│  2. 全局用户配置 (~/.opencode/opencode.jsonc)               │
+├─────────────────────────────────────────────────────────────┤
+│  1. 远程配置 (well-known) - 组织默认配置，最低优先级         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**典型使用场景**：
+- **个人开发者**：使用全局配置 + 项目配置
+- **团队协作**：项目配置 committed 到 Git，确保团队一致
+- **企业部署**：托管配置强制安全策略，用户无法覆盖
+
+### 3.2 配置 Schema
+
+```typescript
+// packages/opencode/src/config/config.ts
+export const Info = z.object({
+  $schema: z.string().optional(),
+  
+  // ==================== 模型配置 ====================
+  model: z.string().optional(),               // 默认模型，格式: provider/model
+  small_model: z.string().optional(),         // 小模型（标题生成等）
+  default_agent: z.string().optional(),       // 默认 Agent
+  
+  // ==================== Provider 配置 ====================
+  provider: z.record(z.string(), Provider).optional(),
+  disabled_providers: z.array(z.string()).optional(),
+  enabled_providers: z.array(z.string()).optional(),
+  
+  // ==================== Agent 配置 ====================
+  agent: z.record(z.string(), Agent).optional(),
+  
+  // ==================== 插件配置 ====================
+  plugin: z.string().array().optional(),
+  
+  // ==================== MCP 配置 ====================
+  mcp: z.record(z.string(), Mcp).optional(),
+  
+  // ==================== 权限配置 ====================
+  permission: Permission.optional(),
+  
+  // ==================== 命令配置 ====================
+  command: z.record(z.string(), Command).optional(),
+  
+  // ==================== 其他配置 ====================
+  theme: z.string().optional(),
+  keybinds: Keybinds.optional(),
+  logLevel: Log.Level.optional(),
+  share: z.enum(["manual", "auto", "disabled"]).optional(),
+  autoupdate: z.union([z.boolean(), z.literal("notify")]).optional(),
+})
+```
+
+### 3.3 配置文件示例
+
+```jsonc
+// opencode.jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  
+  // 模型设置
+  "model": "anthropic/claude-sonnet-4-20250514",
+  "small_model": "openai/gpt-4o-mini",
+  "default_agent": "build",
+  
+  // Provider 配置
+  "provider": {
+    "openai": {
+      "options": {
+        "apiKey": "sk-xxx",
+        "baseURL": "https://api.openai.com/v1"
+      }
+    }
+  },
+  
+  // Agent 配置
+  "agent": {
+    "my-agent": {
+      "description": "我的自定义 Agent",
+      "mode": "primary",
+      "model": "anthropic/claude-sonnet-4-20250514",
+      "prompt": "你是一个专业的代码助手，擅长编写高质量的代码。请始终遵循最佳实践，注重代码可读性和可维护性。",
+      "permission": {
+        "*": "allow",
+        "bash": "ask"
+      }
+    }
+  },
+  
+  // 插件
+  "plugin": [
+    "oh-my-opencode",
+    "my-plugin@1.0.0"
+  ],
+  
+  // MCP
+  "mcp": {
+    "my-mcp": {
+      "type": "local",
+      "command": ["python", "-m", "my_mcp_server"]
+    }
+  },
+  
+  // 权限
+  "permission": {
+    "bash": "ask",
+    "edit": "allow"
+  }
+}
+```
+
+---
+
+## 4. Agent 系统
+
+OpenCode 的 Agent 系统是其核心特性之一，允许定义具有不同能力、权限和行为的 AI 角色。
+
+### 4.1 Agent 定义
+
+**源码位置**: `packages/opencode/src/agent/agent.ts`
+
+**设计理念**：Agent 是一组配置的集合，定义了 AI 的行为边界。通过 Agent，可以：
+- **限制能力**：通过 permission 控制可用工具
+- **定制行为**：通过 prompt 设置专属系统提示
+- **指定模型**：不同 Agent 可以使用不同的 LLM
+- **控制参数**：独立的 temperature、topP 等生成参数
+
+**Agent 字段详解**：
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `name` | string | Agent 唯一标识符 |
+| `description` | string | 描述文本，用于帮助用户选择 |
+| `mode` | enum | 运行模式：primary/subagent/all |
+| `permission` | Ruleset | 权限规则集，控制工具访问 |
+| `model` | object | 指定使用的 Provider/Model |
+| `prompt` | string | System Prompt，定义 AI 角色 |
+| `temperature` | number | 生成温度（0-2） |
+| `steps` | number | 最大推理步数 |
+| `hidden` | boolean | 是否在 UI 中隐藏 |
+
+```typescript
+export namespace Agent {
+  export const Info = z.object({
+    name: z.string(),
+    description: z.string().optional(),
+    mode: z.enum(["subagent", "primary", "all"]),
+    native: z.boolean().optional(),           // 是否内置 Agent（不可删除）
+    hidden: z.boolean().optional(),           // 是否在菜单中隐藏
+    topP: z.number().optional(),              // 采样参数
+    temperature: z.number().optional(),       // 生成温度
+    color: z.string().optional(),             // 主题色（Hex 格式）
+    permission: PermissionNext.Ruleset,       // 权限规则（核心！）
+    model: z.object({
+      modelID: z.string(),
+      providerID: z.string(),
+    }).optional(),
+    variant: z.string().optional(),           // 模型变体（如 thinking）
+    prompt: z.string().optional(),            // System prompt
+    options: z.record(z.string(), z.any()),   // Provider 特定选项
+    steps: z.number().int().positive().optional(),  // 最大推理步数
+  })
+}
+```
+
+### 4.2 内置 Agent
+
+OpenCode 预置了多个 Agent，各有专门用途。理解它们的设计有助于创建自定义 Agent。
+
+**内置 Agent 一览**：
+
+| Agent | 模式 | 用途 | 关键权限 |
+|-------|------|------|---------|
+| `build` | primary | 默认开发 Agent，完整能力 | 几乎所有工具 |
+| `plan` | primary | 规划模式，只读不写 | 禁止 edit |
+| `general` | subagent | 通用子任务执行 | 禁止 todo |
+| `explore` | subagent | 快速代码探索 | 只有读取类工具 |
+| `title` | hidden | 生成会话标题 | 无工具权限 |
+| `summary` | hidden | 生成摘要 | 无工具权限 |
+| `compaction` | hidden | 压缩历史上下文 | 无工具权限 |
+
+```typescript
+// packages/opencode/src/agent/agent.ts
+const result: Record<string, Info> = {
+  // ==================== 主 Agent ====================
+  // build: 默认 Agent，拥有完整的开发能力
+  build: {
+    name: "build",
+    description: "The default agent. Executes tools based on configured permissions.",
+    mode: "primary",
+    native: true,
+    permission: PermissionNext.merge(defaults, {
+      question: "allow",      // 允许向用户提问
+      plan_enter: "allow",    // 允许进入 plan 模式
+    }, user),
+  },
+  
+  // plan: 规划模式，用于讨论方案而不实际修改代码
+  plan: {
+    name: "plan",
+    description: "Plan mode. Disallows all edit tools.",
+    mode: "primary",
+    native: true,
+    permission: PermissionNext.merge(defaults, {
+      question: "allow",
+      plan_exit: "allow",     // 允许退出 plan 模式
+      edit: { "*": "deny" },  // 关键：禁止所有编辑操作
+    }, user),
+  },
+  
+  // ==================== 子 Agent ====================
+  // general: 处理复杂的多步骤任务
+  general: {
+    name: "general",
+    description: "General-purpose agent for researching complex questions and executing multi-step tasks.",
+    mode: "subagent",
+    native: true,
+    permission: PermissionNext.merge(defaults, {
+      todoread: "deny",       // 子 Agent 不管理 TODO
+      todowrite: "deny",
+    }, user),
+  },
+  
+  // explore: 专门用于代码探索，只有读取权限
+  explore: {
+    name: "explore",
+    description: "Fast agent specialized for exploring codebases.",
+    mode: "subagent",
+    native: true,
+    permission: PermissionNext.merge(defaults, {
+      "*": "deny",            // 默认拒绝所有
+      grep: "allow",          // 允许搜索
+      glob: "allow",          // 允许文件匹配
+      list: "allow",          // 允许列目录
+      read: "allow",          // 允许读文件
+      bash: "allow",          // 允许执行命令（受限）
+      webfetch: "allow",      // 允许网络请求
+      websearch: "allow",     // 允许网络搜索
+      codesearch: "allow",    // 允许代码搜索
+    }, user),
+  },
+  
+  // ==================== 隐藏 Agent（内部使用）====================
+  title: { name: "title", mode: "primary", hidden: true, /* 生成标题 */ },
+  summary: { name: "summary", mode: "primary", hidden: true, /* 生成摘要 */ },
+  compaction: { name: "compaction", mode: "primary", hidden: true, /* 压缩上下文 */ },
+}
+```
+
+**权限合并机制**：Agent 的权限通过 `PermissionNext.merge()` 合并，顺序为：
+1. `defaults` - 系统默认权限
+2. Agent 特定权限 - 覆盖默认
+3. `user` - 用户配置的权限，最高优先级
+
+### 4.3 Agent 模式
+
+| 模式 | 说明 | 使用场景 |
+|------|------|---------|
+| `primary` | 主 Agent | 用户可直接选择使用 |
+| `subagent` | 子 Agent | 只能被其他 Agent 调用（Task 工具） |
+| `all` | 全模式 | 两种场景都支持 |
+
+---
+
+## 5. 工具系统
+
+工具（Tool）是 OpenCode 的核心能力载体，让 AI 能够与外部世界交互。每个工具都是一个独立的功能单元，由 LLM 决定何时调用。
+
+### 5.1 工具定义
+
+**源码位置**: `packages/opencode/src/tool/tool.ts`
+
+**设计理念**：工具采用 **声明式定义**，包含三个核心部分：
+1. **description**：LLM 根据描述决定何时使用此工具
+2. **parameters**：Zod Schema 定义参数，自动生成 JSON Schema 给 LLM
+3. **execute**：实际执行逻辑，返回结果给 LLM
+
+**工具执行流程**：
+```
+LLM 决定调用工具 → 生成参数 → 权限检查(ask) → 执行(execute) → 返回结果 → LLM 继续推理
+```
+
+```typescript
+export namespace Tool {
+  export function define<T extends z.ZodRawShape>(
+    id: string,
+    config: {
+      description: string                     // 工具描述（关键！LLM 依赖这个决定是否调用）
+      parameters: z.ZodObject<T>              // 参数 Schema
+      execute: (
+        params: z.infer<z.ZodObject<T>>,      // 类型安全的参数
+        context: ToolContext                   // 执行上下文
+      ) => Promise<{ output: string; title: string; metadata: any }>
+    }
+  ) {
+    return { id, ...config }
+  }
+}
+
+// 工具执行上下文 - 提供工具运行时需要的所有信息
+export type ToolContext = {
+  sessionID: string           // 当前会话 ID
+  messageID: string           // 当前消息 ID
+  agent: string               // 当前 Agent ID
+  directory: string           // 当前工作目录
+  worktree: string            // Git worktree 根目录
+  abort: AbortSignal          // 取消信号（用户中断时触发）
+  metadata(input: { title?: string; metadata?: any }): void  // 更新工具显示信息
+  ask(input: AskInput): Promise<void>  // 请求用户权限（核心！）
+}
+```
+
+**`ctx.ask()` 权限请求机制**：
+- 工具执行敏感操作前必须调用 `ask()` 请求权限
+- 权限可以配置为 `allow`（自动通过）、`ask`（弹窗询问）、`deny`（自动拒绝）
+- 这是 OpenCode 安全模型的核心
+
+### 5.2 内置工具列表
+
+**源码位置**: `packages/opencode/src/tool/registry.ts`
+
+OpenCode 提供了丰富的内置工具，覆盖代码开发的各个环节。
+
+**工具分类说明**：
+
+| 分类 | 工具 | 用途 | 危险等级 |
+|------|------|------|---------|
+| **读取类** | grep, glob, list, read | 搜索和读取代码 | 低 |
+| **修改类** | edit, patch, write | 修改文件内容 | 高 |
+| **执行类** | bash | 执行 Shell 命令 | 高 |
+| **协作类** | task | 委派子任务给 subagent | 中 |
+| **交互类** | question, todo* | 与用户交互 | 低 |
+| **网络类** | webfetch, websearch, codesearch | 网络请求 | 中 |
+| **辅助类** | lsp_hover | IDE 集成 | 低 |
+
+```typescript
+// 核心工具 - 每个工具都是独立的功能单元
+const CORE_TOOLS = [
+  GrepTool,        // 基于正则的代码搜索（类似 ripgrep）
+  GlobTool,        // 文件路径匹配（支持通配符）
+  ListTool,        // 列出目录内容
+  ReadTool,        // 读取文件内容（支持行范围）
+  EditTool,        // 编辑文件（字符串替换）
+  PatchTool,       // 应用 unified diff 格式的补丁
+  BashTool,        // 执行 Shell 命令（最危险的工具！）
+  TaskTool,        // 创建子任务，委派给 subagent 执行
+  TodoWriteTool,   // 写入/更新 TODO 列表
+  TodoReadTool,    // 读取当前 TODO 状态
+  QuestionTool,    // 向用户提问（阻塞等待回答）
+  LspHoverTool,    // 获取 LSP hover 信息（类型定义等）
+]
+
+// 网络工具 - 需要网络访问权限
+const NETWORK_TOOLS = [
+  WebFetchTool,    // 获取网页内容（HTML → Markdown）
+  WebSearchTool,   // 网络搜索（返回摘要结果）
+  CodeSearchTool,  // 代码搜索（通过 Exa API 搜索文档/示例）
+]
+```
+
+**工具来源优先级**：
+1. **内置工具**（CORE_TOOLS + NETWORK_TOOLS）- 始终可用
+2. **目录工具**（`.opencode/tool/*.ts`）- 项目/用户级自定义
+3. **插件工具**（plugin.tool）- 插件动态注册
+
+工具名称冲突时，后加载的覆盖先加载的。
+
+### 5.3 工具示例（Edit 工具）
+
+```typescript
+// packages/opencode/src/tool/edit.ts
+export const EditTool = Tool.define("edit", {
+  description: DESCRIPTION,  // 从 edit.txt 加载详细描述
+  parameters: z.object({
+    filePath: z.string().describe("The absolute path to the file to modify"),
+    oldString: z.string().describe("The text to replace"),
+    new_string: z.string().describe("The replacement text"),
+    replace_all: z.boolean().optional().describe("Replace all occurrences"),
+  }),
+  async execute(params, ctx) {
+    // 请求权限
+    await ctx.ask({
+      permission: "edit",
+      patterns: [params.path],
+    })
+    
+    // 读取文件
+    const content = await Bun.file(params.path).text()
+    
+    // 替换内容
+    let newContent: string
+    if (params.replace_all) {
+      newContent = content.replaceAll(params.old_string, params.new_string)
+    } else {
+      newContent = content.replace(params.old_string, params.new_string)
+    }
+    
+    // 写入文件
+    await Bun.write(params.path, newContent)
+    
+    return {
+      output: `File edited: ${params.path}`,
+      title: `Edit ${params.path}`,
+      metadata: { path: params.path },
+    }
+  },
+})
+```
+
+---
+
+## 6. Provider 系统
+
+Provider 是 OpenCode 与 LLM 服务之间的桥梁。OpenCode 基于 **Vercel AI SDK**，支持市面上几乎所有主流 LLM 服务。
+
+### 6.1 Provider 架构
+
+**源码位置**: `packages/opencode/src/provider/provider.ts`
+
+**设计理念**：
+- **统一接口**：所有 Provider 都实现相同的 AI SDK 接口
+- **自动发现**：根据环境变量自动启用可用的 Provider
+- **可扩展**：支持通过配置或插件添加新 Provider
+
+**Provider 加载流程**：
+```
+1. 从 models.dev 获取 Provider/Model 元数据
+2. 检查环境变量（如 OPENAI_API_KEY）确定可用 Provider
+3. 加载对应的 AI SDK（如 @ai-sdk/openai）
+4. 应用用户配置（options、whitelist、blacklist）
+```
+
+**内置 Provider 列表**：
+
+| Provider | AI SDK | 典型模型 |
+|----------|--------|---------|
+| Anthropic | @ai-sdk/anthropic | Claude 系列 |
+| OpenAI | @ai-sdk/openai | GPT-4o, o1 |
+| Google | @ai-sdk/google | Gemini 系列 |
+| Azure | @ai-sdk/azure | Azure OpenAI |
+| AWS Bedrock | @ai-sdk/amazon-bedrock | Claude, Titan |
+| Groq | @ai-sdk/groq | Llama, Mixtral |
+| xAI | @ai-sdk/xai | Grok |
+| OpenRouter | @openrouter/ai-sdk-provider | 聚合多家模型 |
+
+```typescript
+// 内置 AI SDK Provider - 直接打包，无需运行时安装
+const BUNDLED_PROVIDERS: Record<string, (options: any) => SDK> = {
+  "@ai-sdk/amazon-bedrock": createAmazonBedrock,    // AWS Bedrock
+  "@ai-sdk/anthropic": createAnthropic,              // Anthropic (Claude)
+  "@ai-sdk/azure": createAzure,                      // Azure OpenAI
+  "@ai-sdk/google": createGoogleGenerativeAI,        // Google AI (Gemini)
+  "@ai-sdk/google-vertex": createVertex,             // Google Vertex AI
+  "@ai-sdk/google-vertex/anthropic": createVertexAnthropic,  // Vertex Claude
+  "@ai-sdk/openai": createOpenAI,                    // OpenAI 官方
+  "@ai-sdk/openai-compatible": createOpenAICompatible, // 兼容接口（vLLM/TGI）
+  "@openrouter/ai-sdk-provider": createOpenRouter,   // OpenRouter 聚合
+  "@ai-sdk/xai": createXai,                          // xAI (Grok)
+  "@ai-sdk/mistral": createMistral,                  // Mistral AI
+  "@ai-sdk/groq": createGroq,                        // Groq (超快推理)
+  "@ai-sdk/deepinfra": createDeepInfra,              // DeepInfra
+  "@ai-sdk/cerebras": createCerebras,                // Cerebras
+  "@ai-sdk/cohere": createCohere,                    // Cohere
+  "@ai-sdk/gateway": createGateway,                  // AI Gateway
+  "@ai-sdk/togetherai": createTogetherAI,            // Together AI
+  "@ai-sdk/perplexity": createPerplexity,            // Perplexity
+  "@ai-sdk/vercel": createVercel,                    // Vercel AI
+  "@gitlab/gitlab-ai-provider": createGitLab,        // GitLab AI
+  "@ai-sdk/github-copilot": createGitHubCopilotOpenAICompatible, // GitHub Copilot
+}
+```
+
+**关键设计**：`@ai-sdk/openai-compatible` 是万能适配器，任何兼容 OpenAI API 的服务（vLLM、TGI、Ollama、LocalAI）都可以通过它接入。
+
+### 6.2 模型数据来源
+
+```typescript
+// packages/opencode/src/provider/models.ts
+export namespace ModelsDev {
+  export const Provider = z.object({
+    api: z.string().optional(),
+    name: z.string(),
+    env: z.array(z.string()),  // 环境变量名，如 ["OPENAI_API_KEY"]
+    id: z.string(),
+    npm: z.string().optional(), // AI SDK 包名
+    models: z.record(z.string(), Model),
+  })
+  
+  export const Model = z.object({
+    id: z.string(),
+    name: z.string(),
+    attachment: z.boolean(),      // 是否支持附件
+    reasoning: z.boolean(),       // 是否支持推理
+    tool_call: z.boolean(),       // 是否支持工具调用
+    cost: z.object({
+      input: z.number(),
+      output: z.number(),
+    }).optional(),
+    limit: z.object({
+      context: z.number(),
+      output: z.number(),
+    }),
+  })
+  
+  // 从 https://models.dev/api.json 获取模型数据
+  // 本地缓存在 ~/.cache/opencode/models.json
+}
+```
+
+---
+
+## 7. MCP 系统
+
+### 7.1 MCP 配置类型
+
+**源码位置**: `packages/opencode/src/config/config.ts`
+
+```typescript
+// 本地 MCP Server（stdio）
+export const McpLocal = z.object({
+  type: z.literal("local"),
+  command: z.string().array(),       // 启动命令
+  environment: z.record(z.string(), z.string()).optional(),
+  enabled: z.boolean().optional(),
+  timeout: z.number().optional(),    // 超时时间（毫秒）
+})
+
+// 远程 MCP Server（SSE）
+export const McpRemote = z.object({
+  type: z.literal("remote"),
+  url: z.string(),                   // SSE URL
+  enabled: z.boolean().optional(),
+  headers: z.record(z.string(), z.string()).optional(),
+  oauth: z.union([McpOAuth, z.literal(false)]).optional(),
+  timeout: z.number().optional(),
+})
+```
+
+### 7.2 MCP 配置示例
+
+```jsonc
+{
+  "mcp": {
+    // 本地 MCP Server
+    "my-local-mcp": {
+      "type": "local",
+      "command": ["python", "-m", "my_mcp_server"],
+      "environment": {
+        "API_KEY": "xxx"
+      },
+      "timeout": 30000
+    },
+    
+    // 远程 MCP Server
+    "my-remote-mcp": {
+      "type": "remote",
+      "url": "https://my-mcp-server.com/sse",
+      "headers": {
+        "Authorization": "Bearer xxx"
+      }
+    }
+  }
+}
+```
+
+---
+
+## 8. HTTP Server
+
+### 8.1 Server 架构
+
+**源码位置**: `packages/opencode/src/server/server.ts`
+
+```typescript
+// 使用 Hono 框架
+const app = new Hono()
+  // 错误处理
+  .onError((err, c) => {
+    if (err instanceof NamedError) {
+      let status: ContentfulStatusCode
+      if (err instanceof Storage.NotFoundError) status = 404
+      else if (err instanceof Provider.ModelNotFoundError) status = 400
+      else status = 500
+      return c.json(err.toObject(), { status })
+    }
+    return c.json(new NamedError.Unknown({ message: err.toString() }).toObject(), { status: 500 })
+  })
+  // Basic Auth 中间件（可选）
+  .use((c, next) => {
+    const password = Flag.OPENCODE_SERVER_PASSWORD
+    if (!password) return next()
+    const username = Flag.OPENCODE_SERVER_USERNAME ?? "opencode"
+    return basicAuth({ username, password })(c, next)
+  })
+  // 请求日志
+  .use(async (c, next) => {
+    log.info("request", { method: c.req.method, path: c.req.path })
+    await next()
+  })
+  // CORS 中间件
+  .use(cors({
+    origin(input) {
+      if (!input) return
+      if (input.startsWith("http://localhost:")) return input
+      if (input.startsWith("http://127.0.0.1:")) return input
+      if (input === "tauri://localhost") return input
+      if (/^https:\/\/([a-z0-9-]+\.)*opencode\.ai$/.test(input)) return input
+      return
+    },
+  }))
+  // 路由
+  .route("/global", GlobalRoutes())
+  .route("/project", ProjectRoutes())
+  .route("/session", SessionRoutes())
+  .route("/provider", ProviderRoutes())
+  .route("/mcp", McpRoutes())
+  .route("/config", ConfigRoutes())
+  .route("/file", FileRoutes())
+  .route("/pty", PtyRoutes())
+  .route("/question", QuestionRoutes())
+  .route("/permission", PermissionRoutes())
+  .route("/experimental", ExperimentalRoutes())
+```
+
+### 8.2 主要 API 端点
+
+| 路径 | 方法 | 说明 |
+|------|------|------|
+| `/session` | GET | 列出所有会话 |
+| `/session/:id` | GET | 获取会话详情 |
+| `/session/:id/message` | POST | 发送消息 |
+| `/provider` | GET | 列出所有 Provider |
+| `/provider/:id/models` | GET | 获取 Provider 的模型列表 |
+| `/agent` | GET | 列出所有 Agent |
+| `/mcp` | GET | 列出所有 MCP Server |
+| `/event` | GET | SSE 事件订阅 |
+| `/config` | GET | 获取配置 |
+
+---
+
+# 第二部分：插件系统详解
+
+OpenCode 的插件系统是其可扩展性的核心。通过插件，开发者可以：
+- 添加新工具（tool）
+- 修改配置（config hook）
+- 响应事件（event hook）
+- 拦截/修改行为（各种 hook）
+- 提供自定义认证（auth hook）
+
+## 9. 插件类型定义
+
+### 9.1 Plugin 类型
+
+**源码位置**: `packages/plugin/src/index.ts`
+
+**设计理念**：插件采用 **工厂模式**，是一个接收上下文、返回 Hooks 的异步函数。这种设计允许：
+- 插件初始化时访问 OpenCode 环境信息
+- 插件之间相互独立，互不干扰
+- 支持异步初始化（如网络请求、数据库连接）
+
+**PluginInput 字段详解**：
+
+| 字段 | 类型 | 用途 |
+|------|------|------|
+| `client` | OpencodeClient | 调用 OpenCode API（创建会话、发送消息等） |
+| `project` | Project | 项目元信息（名称、路径） |
+| `directory` | string | 用户当前工作目录 |
+| `worktree` | string | Git 仓库根目录 |
+| `serverUrl` | URL | OpenCode HTTP 服务地址 |
+| `$` | BunShell | 执行 Shell 命令的便捷工具 |
 
 ```typescript
 // 插件输入：OpenCode 传给插件的上下文
@@ -29,36 +1040,67 @@ export type PluginInput = {
   directory: string                                 // 当前工作目录
   worktree: string                                  // Git worktree 根目录
   serverUrl: URL                                    // OpenCode 服务 URL
-  $: BunShell                                       // Bun shell 工具
+  $: BunShell                                       // Bun shell 工具（Bun.$ 的类型）
 }
 
 // 插件类型：一个返回 Hooks 的异步函数
 export type Plugin = (input: PluginInput) => Promise<Hooks>
 ```
 
-### 2.2 Hooks 完整定义
+**插件生命周期**：
+```
+1. OpenCode 启动
+2. 加载配置，发现插件列表
+3. 依次初始化每个插件（调用 Plugin 函数）
+4. 收集所有 Hooks
+5. 运行时触发相应 Hook
+```
+
+### 9.2 Hooks 完整定义
+
+Hooks 是插件与 OpenCode 交互的主要方式。每个 Hook 都是可选的，插件只需实现需要的 Hook。
+
+**Hook 分类与用途**：
+
+| Hook 类型 | 触发时机 | 典型用途 |
+|----------|---------|---------|
+| `config` | 配置加载后 | 动态注入 Agent、MCP、命令 |
+| `event` | 任何事件发生 | 日志、统计、通知 |
+| `tool` | 注册时（非触发） | 提供自定义工具 |
+| `auth` | 认证时 | 自定义 Provider 认证流程 |
+| `chat.message` | 用户发消息 | 消息预处理、关键词检测 |
+| `chat.params` | LLM 调用前 | 修改 temperature 等参数 |
+| `tool.execute.*` | 工具执行前后 | 审计、日志、结果修改 |
+| `permission.ask` | 权限请求时 | 自动审批策略 |
+
+**Hook 执行顺序**：多个插件的同名 Hook 按插件加载顺序依次执行，前一个插件的修改会传递给下一个。
 
 ```typescript
 export interface Hooks {
   // ==================== 配置相关 ====================
-  // 在 OpenCode 加载配置后调用，可以修改 config
+  // 配置加载完成后调用，可以直接修改 config 对象
+  // 用途：动态添加 Agent、MCP Server、Commands 等
   config?: (input: Config) => Promise<void>
   
   // ==================== 事件相关 ====================
-  // 接收所有 OpenCode 事件（session.created, message.updated 等）
+  // 接收所有 OpenCode 事件（session.created、tool.completed 等）
+  // 用途：日志记录、状态同步、通知推送
   event?: (input: { event: Event }) => Promise<void>
   
   // ==================== 工具相关 ====================
-  // 插件提供的工具集合
+  // 插件提供的工具集合（不是 Hook，而是静态定义）
+  // 用途：扩展 AI 的能力（如搜索、API 调用等）
   tool?: {
     [key: string]: ToolDefinition
   }
   
   // ==================== 认证相关 ====================
+  // 为自定义 Provider 提供认证方式
+  // 用途：支持 OAuth、API Key 等认证流程
   auth?: AuthHook
   
   // ==================== 聊天相关 ====================
-  // 用户发送消息时触发
+  // 用户发送消息时触发（消息到达 LLM 前）
   "chat.message"?: (
     input: {
       sessionID: string
@@ -101,34 +1143,20 @@ export interface Hooks {
   // 工具执行后，可以修改输出
   "tool.execute.after"?: (
     input: { tool: string; sessionID: string; callID: string },
-    output: {
-      title: string
-      output: string
-      metadata: any
-    },
+    output: { title: string; output: string; metadata: any },
   ) => Promise<void>
   
   // ==================== 实验性功能 ====================
-  // 转换消息列表
   "experimental.chat.messages.transform"?: (
     input: {},
-    output: {
-      messages: {
-        info: Message
-        parts: Part[]
-      }[]
-    },
+    output: { messages: { info: Message; parts: Part[] }[] },
   ) => Promise<void>
   
-  // 转换 system prompt
   "experimental.chat.system.transform"?: (
     input: { sessionID?: string; model: Model },
-    output: {
-      system: string[]
-    },
+    output: { system: string[] },
   ) => Promise<void>
   
-  // 会话压缩
   "experimental.session.compacting"?: (
     input: { sessionID: string },
     output: { context: string[]; prompt?: string },
@@ -136,30 +1164,30 @@ export interface Hooks {
 }
 ```
 
-### 2.3 Tool 定义
+### 9.3 Tool 定义辅助函数
 
-**文件位置**: `opencode-dev/packages/plugin/src/tool.ts`
+**源码位置**: `packages/plugin/src/tool.ts`
 
 ```typescript
 import { z } from "zod"
 
-// 工具执行时的上下文
+// 工具执行上下文
 export type ToolContext = {
-  sessionID: string          // 当前会话 ID
-  messageID: string          // 当前消息 ID
-  agent: string              // 当前 Agent
-  directory: string          // 当前工作目录
-  worktree: string           // Git worktree
-  abort: AbortSignal         // 中止信号
-  metadata(input: { title?: string; metadata?: { [key: string]: any } }): void  // 设置元数据
-  ask(input: AskInput): Promise<void>  // 请求权限
+  sessionID: string
+  messageID: string
+  agent: string
+  directory: string
+  worktree: string
+  abort: AbortSignal
+  metadata(input: { title?: string; metadata?: any }): void
+  ask(input: AskInput): Promise<void>
 }
 
 // 定义工具的辅助函数
 export function tool<Args extends z.ZodRawShape>(input: {
-  description: string                                           // 工具描述（给 LLM 看）
-  args: Args                                                    // 参数定义（使用 zod）
-  execute(args: z.infer<z.ZodObject<Args>>, context: ToolContext): Promise<string>  // 执行函数
+  description: string
+  args: Args
+  execute(args: z.infer<z.ZodObject<Args>>, context: ToolContext): Promise<string>
 }) {
   return input
 }
@@ -170,9 +1198,11 @@ export type ToolDefinition = ReturnType<typeof tool>
 
 ---
 
-## 三、OpenCode 如何加载插件
+## 10. 插件加载机制
 
-**文件位置**: `opencode-dev/packages/opencode/src/plugin/index.ts`
+### 10.1 加载流程
+
+**源码位置**: `packages/opencode/src/plugin/index.ts`
 
 ```typescript
 export namespace Plugin {
@@ -181,11 +1211,13 @@ export namespace Plugin {
   const INTERNAL_PLUGINS: PluginInstance[] = [CodexAuthPlugin, CopilotAuthPlugin]
 
   const state = Instance.state(async () => {
-    const client = createOpencodeClient({ /* ... */ })
+    const client = createOpencodeClient({
+      baseUrl: "http://localhost:4096",
+      fetch: async (...args) => Server.App().fetch(...args),
+    })
     const config = await Config.get()
     const hooks: Hooks[] = []
     
-    // 传给插件的输入
     const input: PluginInput = {
       client,
       project: Instance.project,
@@ -195,9 +1227,8 @@ export namespace Plugin {
       $: Bun.$,
     }
 
-    // 1. 加载内置插件
+    // 1. 加载内部插件
     for (const plugin of INTERNAL_PLUGINS) {
-      log.info("loading internal plugin", { name: plugin.name })
       const init = await plugin(input)
       hooks.push(init)
     }
@@ -209,9 +1240,7 @@ export namespace Plugin {
     }
 
     for (let plugin of plugins) {
-      log.info("loading plugin", { path: plugin })
-      
-      // 如果是 npm 包，先安装
+      // npm 包需要先安装
       if (!plugin.startsWith("file://")) {
         const lastAtIndex = plugin.lastIndexOf("@")
         const pkg = lastAtIndex > 0 ? plugin.substring(0, lastAtIndex) : plugin
@@ -223,437 +1252,37 @@ export namespace Plugin {
       const mod = await import(plugin)
       
       // 调用所有导出的函数
-      const seen = new Set<PluginInstance>()
       for (const [_name, fn] of Object.entries<PluginInstance>(mod)) {
-        if (seen.has(fn)) continue
-        seen.add(fn)
-        const init = await fn(input)  // 调用插件，获取 Hooks
-        hooks.push(init)              // 收集所有 Hooks
+        const init = await fn(input)
+        hooks.push(init)
       }
     }
 
     return { hooks, input }
   })
-
-  // Hooks 触发机制：按顺序调用所有插件的同名 hook
-  export async function trigger<Name, Input, Output>(
-    name: Name, 
-    input: Input, 
-    output: Output
-  ): Promise<Output> {
-    if (!name) return output
-    for (const hook of await state().then((x) => x.hooks)) {
-      const fn = hook[name]
-      if (!fn) continue
-      await fn(input, output)  // 前一个插件的修改会传给下一个
-    }
-    return output
-  }
-
-  // 插件初始化
-  export async function init() {
-    const hooks = await state().then((x) => x.hooks)
-    const config = await Config.get()
-    
-    // 调用所有插件的 config hook
-    for (const hook of hooks) {
-      await hook.config?.(config)
-    }
-    
-    // 订阅所有事件，转发给插件
-    Bus.subscribeAll(async (input) => {
-      const hooks = await state().then((x) => x.hooks)
-      for (const hook of hooks) {
-        hook["event"]?.({ event: input })
-      }
-    })
-  }
 }
 ```
 
----
-
-## 四、编写一个最简单的插件
+### 10.2 Hooks 触发机制
 
 ```typescript
-import type { Plugin, Hooks, PluginInput } from "@opencode-ai/plugin";
-import { tool } from "@opencode-ai/plugin";
-
-// 插件入口
-const MyPlugin: Plugin = async (ctx: PluginInput): Promise<Hooks> => {
-  console.log("插件加载中...", { directory: ctx.directory });
-
-  return {
-    // ========== 1. 注册工具 ==========
-    tool: {
-      my_hello_tool: tool({
-        description: "向用户打招呼",
-        args: {
-          name: tool.schema.string().describe("用户名"),
-        },
-        async execute(args, context) {
-          return `你好，${args.name}！当前目录是 ${context.directory}`;
-        },
-      }),
-    },
-
-    // ========== 2. 修改配置（注入 Agent） ==========
-    config: async (config) => {
-      // 注入自定义 Agent
-      config.agent = {
-        ...config.agent,
-        "my-agent": {
-          name: "my-agent",
-          description: "我的自定义 Agent",
-          mode: "all",
-          prompt: "你是一个友好的助手。可以使用 my_hello_tool 向用户打招呼。",
-          permission: { "*": "allow" },
-        },
-      };
-      
-      // 注入 MCP 配置
-      config.mcp = {
-        ...config.mcp,
-        "my-mcp": {
-          type: "sse",
-          url: "http://localhost:8000/mcp/sse",
-        },
-      };
-    },
-
-    // ========== 3. 监听事件 ==========
-    event: async ({ event }) => {
-      if (event.type === "session.created") {
-        console.log("新会话创建:", event.properties);
-      }
-    },
-
-    // ========== 4. 处理用户消息 ==========
-    "chat.message": async (input, output) => {
-      console.log("用户消息:", output.parts);
-      
-      // 可以在这里检测关键词、修改消息等
-    },
-
-    // ========== 5. 工具执行前后 ==========
-    "tool.execute.before": async (input, output) => {
-      console.log(`工具 ${input.tool} 即将执行，参数:`, output.args);
-      
-      // 可以修改参数
-      // output.args.xxx = "modified";
-    },
-
-    "tool.execute.after": async (input, output) => {
-      console.log(`工具 ${input.tool} 执行完成，输出:`, output.output);
-      
-      // 可以修改输出
-      // output.output = "modified output";
-    },
-  };
-};
-
-export default MyPlugin;
-```
-
----
-
-## 五、oh-my-opencode 插件入口解析
-
-**文件位置**: `oh-my-opencode/src/index.ts`
-
-```typescript
-import type { Plugin } from "@opencode-ai/plugin";
-import { createConfigHandler } from "./plugin-handlers";
-import {
-  builtinTools,
-  createCallOmoAgent,
-  createBackgroundTools,
-  createDelegateTask,
-  createSkillTool,
-  interactive_bash,
-  // ... 更多工具
-} from "./tools";
-
-const OhMyOpenCodePlugin: Plugin = async (ctx) => {
-  log("[OhMyOpenCodePlugin] ENTRY - plugin loading", { directory: ctx.directory });
-
-  // 加载插件配置
-  const pluginConfig = loadPluginConfig(ctx.directory, ctx);
-  const disabledHooks = new Set(pluginConfig.disabled_hooks ?? []);
-
-  // 创建各种功能模块
-  const backgroundManager = new BackgroundManager(ctx, pluginConfig.background_task, { /* ... */ });
-  const callOmoAgent = createCallOmoAgent(ctx, backgroundManager);
-  const delegateTask = createDelegateTask({ manager: backgroundManager, client: ctx.client, /* ... */ });
-  const skillTool = createSkillTool({ skills: mergedSkills, /* ... */ });
-
-  // 创建 config handler
-  const configHandler = createConfigHandler({
-    ctx: { directory: ctx.directory, client: ctx.client },
-    pluginConfig,
-    modelCacheState,
-  });
-
-  // 返回 Hooks
-  return {
-    // ========== 工具 ==========
-    tool: {
-      ...builtinTools,                    // 内置工具
-      ...backgroundTools,                 // 后台任务工具
-      call_omo_agent: callOmoAgent,       // 调用 Agent
-      delegate_task: delegateTask,        // 委派任务
-      skill: skillTool,                   // Skill 工具
-      skill_mcp: skillMcpTool,            // Skill MCP
-      slashcommand: slashcommandTool,     // 斜杠命令
-      interactive_bash,                   // 交互式 bash
-      // ...
-    },
-
-    // ========== 配置（注入 Agent 等） ==========
-    config: configHandler,
-
-    // ========== 事件处理 ==========
-    event: async (input) => {
-      await autoUpdateChecker?.event(input);
-      await claudeCodeHooks.event(input);
-      await backgroundNotificationHook?.event(input);
-      await sessionNotification?.(input);
-      // ... 更多事件处理
-      
-      const { event } = input;
-      const props = event.properties as Record<string, unknown> | undefined;
-
-      if (event.type === "session.created") {
-        const sessionInfo = props?.info as { id?: string; title?: string; parentID?: string } | undefined;
-        log("[event] session.created", { sessionInfo, props });
-        if (!sessionInfo?.parentID) {
-          setMainSession(sessionInfo?.id);
-        }
-      }
-
-      if (event.type === "session.deleted") {
-        const sessionInfo = props?.info as { id?: string } | undefined;
-        if (sessionInfo?.id === getMainSessionID()) {
-          setMainSession(undefined);
-        }
-      }
-    },
-
-    // ========== 用户消息处理 ==========
-    "chat.message": async (input, output) => {
-      if (input.agent) {
-        setSessionAgent(input.sessionID, input.agent);
-      }
-
-      // 应用 Agent variant
-      const message = (output as { message: { variant?: string } }).message;
-      applyAgentVariant(pluginConfig, input.agent, message);
-
-      // 调用各种 hook
-      await stopContinuationGuard?.["chat.message"]?.(input);
-      await keywordDetector?.["chat.message"]?.(input, output);
-      await claudeCodeHooks["chat.message"]?.(input, output);
-      await autoSlashCommand?.["chat.message"]?.(input, output);
-    },
-
-    // ========== 工具执行前 ==========
-    "tool.execute.before": async (input, output) => {
-      await subagentQuestionBlocker["tool.execute.before"]?.(input, output);
-      await questionLabelTruncator["tool.execute.before"]?.(input, output);
-      await claudeCodeHooks["tool.execute.before"](input, output);
-      await commentChecker?.["tool.execute.before"](input, output);
-      await directoryAgentsInjector?.["tool.execute.before"]?.(input, output);
-      await rulesInjector?.["tool.execute.before"]?.(input, output);
-      // ... 更多 hook
-    },
-
-    // ========== 工具执行后 ==========
-    "tool.execute.after": async (input, output) => {
-      if (!output) return;  // 防止 undefined
-      
-      await claudeCodeHooks["tool.execute.after"](input, output);
-      await toolOutputTruncator?.["tool.execute.after"](input, output);
-      await contextWindowMonitor?.["tool.execute.after"](input, output);
-      await commentChecker?.["tool.execute.after"](input, output);
-      // ... 更多 hook
-    },
-
-    // ========== 消息转换 ==========
-    "experimental.chat.messages.transform": async (input, output) => {
-      await contextInjectorMessagesTransform?.["experimental.chat.messages.transform"]?.(input, output);
-      await thinkingBlockValidator?.["experimental.chat.messages.transform"]?.(input, output);
-    },
-  };
-};
-
-export default OhMyOpenCodePlugin;
-```
-
----
-
-## 六、oh-my-opencode 如何注入 Agent
-
-**文件位置**: `oh-my-opencode/src/plugin-handlers/config-handler.ts`
-
-```typescript
-export function createConfigHandler(deps: ConfigHandlerDeps) {
-  const { ctx, pluginConfig, modelCacheState } = deps;
-
-  return async (config: Record<string, unknown>) => {
-    // 1. 创建内置 Agent
-    const builtinAgents = await createBuiltinAgents(
-      migratedDisabledAgents,
-      pluginConfig.agents,
-      ctx.directory,
-      undefined,
-      pluginConfig.categories,
-      pluginConfig.git_master,
-      allDiscoveredSkills,
-      ctx.client,
-      browserProvider,
-      currentModel
-    );
-
-    // 2. 加载用户和项目的 Agent
-    const userAgents = (pluginConfig.claude_code?.agents ?? true)
-      ? loadUserAgents()
-      : {};
-    const projectAgents = (pluginConfig.claude_code?.agents ?? true)
-      ? loadProjectAgents()
-      : {};
-    const pluginAgents = pluginComponents.agents;
-
-    // 3. 特殊处理 Sisyphus Agent
-    const isSisyphusEnabled = pluginConfig.sisyphus_agent?.disabled !== true;
-    if (isSisyphusEnabled && builtinAgents.sisyphus) {
-      // 设置默认 Agent 为 Sisyphus
-      (config as { default_agent?: string }).default_agent = "sisyphus";
-
-      const agentConfig: Record<string, unknown> = {
-        sisyphus: builtinAgents.sisyphus,
-        "sisyphus-junior": createSisyphusJuniorAgentWithOverrides(/*...*/),
-      };
-
-      // 创建 Prometheus (规划 Agent)
-      if (plannerEnabled) {
-        agentConfig["prometheus"] = {
-          name: "prometheus",
-          model: resolvedModel,
-          mode: "all" as const,
-          prompt: PROMETHEUS_SYSTEM_PROMPT,
-          permission: PROMETHEUS_PERMISSION,
-          description: "Plan agent (Prometheus - OhMyOpenCode)",
-          color: "#9D4EDD",
-        };
-      }
-
-      // 4. 合并所有 Agent 到 config.agent
-      config.agent = {
-        ...agentConfig,                                    // oh-my-opencode 的 Agent
-        ...Object.fromEntries(                             // 其他内置 Agent
-          Object.entries(builtinAgents).filter(([k]) => k !== "sisyphus")
-        ),
-        ...userAgents,                                     // 用户定义的 Agent
-        ...projectAgents,                                  // 项目定义的 Agent
-        ...pluginAgents,                                   // 插件定义的 Agent
-        ...filteredConfigAgents,                           // OpenCode 原有的 Agent
-        build: { ...migratedBuild, mode: "subagent", hidden: true },
-      };
-    } else {
-      // Sisyphus 禁用时的合并方式
-      config.agent = {
-        ...builtinAgents,
-        ...userAgents,
-        ...projectAgents,
-        ...pluginAgents,
-        ...configAgent,
-      };
-    }
-
-    // 5. 重新排序 Agent
-    if (config.agent) {
-      config.agent = reorderAgentsByPriority(config.agent as Record<string, unknown>);
-    }
-
-    // 6. 配置工具权限
-    config.tools = {
-      ...(config.tools as Record<string, unknown>),
-      "grep_app_*": false,
-      LspHover: false,
-      // ...
-    };
-
-    // 7. 为特定 Agent 设置权限
-    const agentResult = config.agent as AgentConfig;
-    if (agentResult.sisyphus) {
-      const agent = agentResult.sisyphus as AgentWithPermission;
-      agent.permission = { 
-        ...agent.permission, 
-        call_omo_agent: "deny", 
-        delegate_task: "allow", 
-        question: "allow" 
-      };
-    }
-
-    // 8. 加载 MCP 配置
-    const mcpResult = (pluginConfig.claude_code?.mcp ?? true)
-      ? await loadMcpConfigs()
-      : { servers: {} };
-
-    config.mcp = {
-      ...createBuiltinMcps(pluginConfig.disabled_mcps),
-      ...(config.mcp as Record<string, unknown>),
-      ...mcpResult.servers,
-      ...pluginComponents.mcpServers,
-    };
-
-    // 9. 加载命令
-    config.command = {
-      ...builtinCommands,
-      ...userCommands,
-      ...userSkills,
-      ...systemCommands,
-      ...projectCommands,
-      ...projectSkills,
-      ...pluginComponents.commands,
-      ...pluginComponents.skills,
-    };
-  };
-}
-```
-
----
-
-## 七、如何集成自定义插件到 OpenCode
-
-### 7.1 用户配置
-
-在项目根目录创建 `.opencode/opencode.jsonc`:
-
-```jsonc
-{
-  // 加载插件（npm 包名或本地路径）
-  "plugin": [
-    "oh-my-opencode",                           // npm 包
-    "my-custom-plugin@1.0.0",                   // 带版本
-    "file:///path/to/local/plugin",             // 本地路径
-    "git+https://github.com/xxx/plugin.git"    // Git 仓库
-  ],
-  
-  // 设置默认 Agent
-  "agent": "sisyphus",
-  
-  // 配置 MCP
-  "mcp": {
-    "my-server": {
-      "type": "sse",
-      "url": "http://localhost:8000/mcp/sse"
-    }
+// packages/opencode/src/plugin/index.ts
+export async function trigger<Name, Input, Output>(
+  name: Name, 
+  input: Input, 
+  output: Output
+): Promise<Output> {
+  if (!name) return output
+  for (const hook of await state().then((x) => x.hooks)) {
+    const fn = hook[name]
+    if (!fn) continue
+    await fn(input, output)  // 前一个插件的修改会传给下一个
   }
+  return output
 }
 ```
 
-### 7.2 插件加载流程
+### 10.3 加载流程图
 
 ```
 OpenCode 启动
@@ -664,160 +1293,265 @@ Config.get() 读取配置
     ▼
 Plugin.state() 初始化
     │
-    ├─▶ 加载内置插件 (CodexAuthPlugin, CopilotAuthPlugin)
+    ├─▶ 加载内部插件 (CodexAuthPlugin, CopilotAuthPlugin)
     │
     ├─▶ 遍历 config.plugin 数组
     │       │
-    │       ├─▶ 如果是 npm 包，执行 BunProc.install() 安装
+    │       ├─▶ npm 包 → BunProc.install() 安装
     │       │
     │       └─▶ import(plugin) 动态导入
     │               │
-    │               └─▶ 调用导出的函数，传入 PluginInput
+    │               └─▶ 调用导出函数，传入 PluginInput
     │                       │
     │                       └─▶ 收集返回的 Hooks
     │
     ▼
 Plugin.init() 初始化
     │
-    ├─▶ 对每个 Hooks 调用 hook.config?.(config)
-    │       │
-    │       └─▶ 插件可以修改 config.agent, config.mcp, config.tools 等
+    ├─▶ 调用所有 hook.config?.(config)
     │
-    └─▶ 订阅所有事件，转发给 hook.event
-            │
-            └─▶ 插件可以响应 session.created, message.updated 等事件
+    └─▶ 订阅事件 → 转发给 hook.event
 ```
 
-### 7.3 Hooks 触发时机
-
-| Hook | 触发时机 |
-|------|----------|
-| `config` | 插件初始化时，用于修改全局配置 |
-| `event` | 任何 OpenCode 事件（session、message 等） |
-| `chat.message` | 用户发送消息时 |
-| `chat.params` | 请求 LLM 前，修改参数 |
-| `chat.headers` | 请求 LLM 前，修改请求头 |
-| `tool.execute.before` | 工具执行前，可修改参数 |
-| `tool.execute.after` | 工具执行后，可修改输出 |
-| `permission.ask` | 请求权限时 |
-| `command.execute.before` | 执行命令前 |
-
 ---
 
-## 八、关键代码文件索引
+## 11. 编写插件
 
-| 文件 | 说明 |
-|------|------|
-| `opencode-dev/packages/plugin/src/index.ts` | Plugin、Hooks、PluginInput 类型定义 |
-| `opencode-dev/packages/plugin/src/tool.ts` | ToolDefinition、ToolContext 类型定义 |
-| `opencode-dev/packages/opencode/src/plugin/index.ts` | 插件加载、初始化、trigger 机制 |
-| `opencode-dev/packages/opencode/src/config/config.ts` | 配置加载与合并 |
-| `opencode-dev/packages/opencode/src/agent/agent.ts` | Agent 定义与合并 |
-| `opencode-dev/packages/opencode/src/tool/registry.ts` | 工具注册（内置 + 目录 + 插件） |
-| `oh-my-opencode/src/index.ts` | oh-my-opencode 插件入口 |
-| `oh-my-opencode/src/plugin-handlers/config-handler.ts` | Agent 注入逻辑 |
-
----
-
-## 九、总结
-
-### 开发插件的核心步骤
-
-1. **创建插件入口函数**
-   ```typescript
-   const MyPlugin: Plugin = async (ctx: PluginInput): Promise<Hooks> => {
-     return { /* hooks */ };
-   };
-   export default MyPlugin;
-   ```
-
-2. **注册工具**（`tool`）
-   ```typescript
-   tool: {
-     my_tool: tool({
-       description: "...",
-       args: { /* zod schema */ },
-       execute: async (args, ctx) => { return "result"; },
-     }),
-   }
-   ```
-
-3. **注入 Agent**（`config` hook）
-   ```typescript
-   config: async (config) => {
-     config.agent = { ...config.agent, "my-agent": { /* ... */ } };
-   }
-   ```
-
-4. **监听事件**（`event` hook）
-   ```typescript
-   event: async ({ event }) => {
-     if (event.type === "session.created") { /* ... */ }
-   }
-   ```
-
-5. **拦截工具执行**（`tool.execute.before/after`）
-   ```typescript
-   "tool.execute.before": async (input, output) => {
-     // 修改 output.args
-   }
-   ```
-
-### 集成方式
-
-1. **npm 发布**: `npm publish` 后配置 `"plugin": ["my-plugin"]`
-2. **Git 仓库**: `"plugin": ["git+https://github.com/xxx/plugin.git"]`
-3. **本地路径**: `"plugin": ["file:///path/to/plugin"]`
-4. **压缩包 URL**: `npm install https://xxx/plugin-1.0.0.tgz`
-
----
-
-## 十、账号认证接入
-
-OpenCode 的认证分为两个层面：
-1. **用户账号认证**：用户使用 OpenCode 前的身份验证
-2. **Provider 认证**：访问 LLM Provider API 的认证
-
-### 10.1 用户账号认证架构
-
-#### 10.1.1 Console 云端服务（opencode.ai）
-
-**源码位置**：
-- `packages/console/function/src/auth.ts` - OpenAuth 认证服务
-- `packages/console/core/src/schema/auth.sql.ts` - 数据库 Schema
-- `packages/console/app/src/context/auth.ts` - 前端认证 Context
-
-**数据库 Schema（真实源码）**：
+### 11.1 最简单的插件
 
 ```typescript
-// packages/console/core/src/schema/auth.sql.ts
-export const AuthProvider = ["email", "github", "google"] as const
+import type { Plugin, Hooks, PluginInput } from "@opencode-ai/plugin";
+import { tool } from "@opencode-ai/plugin";
 
-export const AuthTable = mysqlTable("auth", {
-  id: id(),
-  ...timestamps,
-  provider: mysqlEnum("provider", AuthProvider).notNull(),
-  subject: varchar("subject", { length: 255 }).notNull(),  // 第三方用户 ID
-  accountID: ulid("account_id").notNull(),                 // OpenCode 账号 ID
-}, (table) => [
-  primaryKey({ columns: [table.id] }),
-  uniqueIndex("provider").on(table.provider, table.subject),
-  index("account_id").on(table.accountID),
-])
+const MyPlugin: Plugin = async (ctx: PluginInput): Promise<Hooks> => {
+  console.log("插件加载中...", { directory: ctx.directory });
+
+  return {
+    // 注册工具
+    tool: {
+      my_hello: tool({
+        description: "向用户打招呼",
+        args: {
+          name: tool.schema.string().describe("用户名"),
+        },
+        async execute(args, context) {
+          return `你好，${args.name}！当前目录: ${context.directory}`;
+        },
+      }),
+    },
+
+    // 修改配置
+    config: async (config) => {
+      config.agent = {
+        ...config.agent,
+        "my-agent": {
+          description: "我的自定义 Agent",
+          mode: "primary",
+          prompt: "你是一个友好的助手。",
+          permission: { "*": "allow" },
+        },
+      };
+    },
+
+    // 监听事件
+    event: async ({ event }) => {
+      if (event.type === "session.created") {
+        console.log("新会话:", event.properties);
+      }
+    },
+  };
+};
+
+export default MyPlugin;
 ```
 
-**OpenAuth 认证服务（真实源码）**：
+### 11.2 Hooks 触发时机
+
+| Hook | 触发时机 | 用途 |
+|------|----------|------|
+| `config` | 插件初始化时 | 修改全局配置（Agent、MCP、权限等） |
+| `event` | 任何 OpenCode 事件 | 响应 session、message 等事件 |
+| `tool` | 注册时（非回调） | 提供自定义工具 |
+| `auth` | 认证时 | 提供自定义 Provider 认证 |
+| `chat.message` | 用户发送消息时 | 检测关键词、修改消息 |
+| `chat.params` | 请求 LLM 前 | 修改 temperature、topP 等参数 |
+| `chat.headers` | 请求 LLM 前 | 修改请求头 |
+| `tool.execute.before` | 工具执行前 | 修改工具参数 |
+| `tool.execute.after` | 工具执行后 | 修改工具输出 |
+| `permission.ask` | 请求权限时 | 自动批准/拒绝权限 |
+
+---
+
+## 12. oh-my-opencode 案例分析
+
+### 12.1 项目结构
+
+```
+oh-my-opencode/
+├── src/
+│   ├── index.ts              # 插件入口
+│   ├── plugin-handlers/
+│   │   └── config-handler.ts # 配置处理（注入 Agent）
+│   ├── tools/                # 自定义工具
+│   │   ├── index.ts          # 工具导出
+│   │   ├── delegate-task/    # 任务委派
+│   │   ├── interactive-bash/ # 交互式 Bash
+│   │   ├── call-omo-agent/   # Agent 调用
+│   │   ├── background-task/  # 后台任务
+│   │   ├── session-manager/  # 会话管理
+│   │   ├── skill/            # 技能工具
+│   │   ├── skill-mcp/        # MCP 技能
+│   │   ├── grep/             # 搜索工具
+│   │   ├── glob/             # 文件匹配
+│   │   ├── lsp/              # LSP 工具
+│   │   ├── look-at/          # 文件查看
+│   │   └── ast-grep/         # AST 搜索
+│   ├── agents/               # Agent 定义
+│   ├── features/             # 功能模块
+│   ├── hooks/                # Hook 实现
+│   └── shared/               # 共享工具
+└── package.json
+```
+
+### 12.2 入口文件分析
 
 ```typescript
-// packages/console/function/src/auth.ts
-import { issuer } from "@openauthjs/openauth"
-import { GithubProvider } from "@openauthjs/openauth/provider/github"
-import { GoogleOidcProvider } from "@openauthjs/openauth/provider/google"
+// oh-my-opencode/src/index.ts
+const OhMyOpenCodePlugin: Plugin = async (ctx) => {
+  // 加载配置
+  const pluginConfig = loadPluginConfig(ctx.directory, ctx);
+  
+  // 创建功能模块
+  const backgroundManager = new BackgroundManager(ctx, pluginConfig.background_task);
+  const callOmoAgent = createCallOmoAgent(ctx, backgroundManager);
+  const delegateTask = createDelegateTask({ manager: backgroundManager, client: ctx.client });
+  const configHandler = createConfigHandler({ ctx, pluginConfig });
 
+  return {
+    // 工具
+    tool: {
+      ...builtinTools,
+      call_omo_agent: callOmoAgent,
+      delegate_task: delegateTask,
+      interactive_bash,
+      look_at: createLookAt(ctx),
+      skill: createSkillTool(ctx),
+      skill_mcp: createSkillMcpTool(ctx),
+      slashcommand: createSlashcommandTool(ctx),
+      task: createTask(ctx),
+      ...createBackgroundTools(backgroundManager),
+    },
+
+    // 配置
+    config: configHandler,
+
+    // 事件
+    event: async (input) => {
+      await autoUpdateChecker?.event(input);
+      await claudeCodeHooks.event(input);
+      await sessionNotification?.event(input);
+      await sessionRecovery?.event(input);
+      await contextWindowMonitor?.event(input);
+    },
+
+    // 消息处理
+    "chat.message": async (input, output) => {
+      await keywordDetector?.["chat.message"]?.(input, output);
+      await autoSlashCommand?.["chat.message"]?.(input, output);
+      await agentUsageReminder?.["chat.message"]?.(input, output);
+      await firstMessageVariantGate?.["chat.message"]?.(input, output);
+    },
+
+    // 工具执行
+    "tool.execute.before": async (input, output) => {
+      await rulesInjector?.["tool.execute.before"]?.(input, output);
+      await directoryAgentsInjector?.["tool.execute.before"]?.(input, output);
+      await directoryReadmeInjector?.["tool.execute.before"]?.(input, output);
+    },
+
+    "tool.execute.after": async (input, output) => {
+      await toolOutputTruncator?.["tool.execute.after"](input, output);
+      await commentChecker?.["tool.execute.after"]?.(input, output);
+      await emptyTaskResponseDetector?.["tool.execute.after"]?.(input, output);
+    },
+  };
+};
+```
+
+### 12.3 Agent 注入逻辑
+
+```typescript
+// oh-my-opencode/src/plugin-handlers/config-handler.ts
+export function createConfigHandler(deps: ConfigHandlerDeps) {
+  return async (config: Record<string, unknown>) => {
+    // 1. 创建内置 Agent
+    const builtinAgents = await createBuiltinAgents({
+      ctx: deps.ctx,
+      pluginConfig: deps.pluginConfig,
+      skills: deps.skills,
+    });
+
+    // 2. 加载用户/项目 Agent
+    const userAgents = loadUserAgents(deps.ctx.directory);
+    const projectAgents = loadProjectAgents(deps.ctx.directory);
+
+    // 3. 处理 Sisyphus Agent（oh-my-opencode 的主 Agent）
+    if (isSisyphusEnabled && builtinAgents.sisyphus) {
+      config.default_agent = "sisyphus";
+      
+      config.agent = {
+        sisyphus: builtinAgents.sisyphus,
+        "sisyphus-junior": createSisyphusJuniorAgent(),
+        prometheus: createPrometheusAgent(),  // 规划 Agent
+        ...userAgents,
+        ...projectAgents,
+        // 将原 build 改为 subagent
+        build: { ...migratedBuild, mode: "subagent", hidden: true },
+      };
+    }
+
+    // 4. 配置 MCP
+    config.mcp = {
+      ...createBuiltinMcps(),
+      ...config.mcp,
+    };
+
+    // 5. 配置命令
+    config.command = {
+      ...builtinCommands,
+      ...userCommands,
+      ...projectCommands,
+    };
+  };
+}
+```
+
+---
+
+# 第三部分：扩展机制指南
+
+## 13. 认证扩展
+
+### 13.1 认证架构概述
+
+OpenCode 的认证分为三个层面：
+
+| 层面 | 说明 | 实现位置 |
+|------|------|---------|
+| 用户账号（云端） | opencode.ai 网站登录 | `packages/console/function/src/auth.ts` |
+| 本地服务认证 | CLI 本地 Server 的访问控制 | `packages/opencode/src/server/server.ts` |
+| Provider 认证 | LLM API Key/OAuth | `packages/opencode/src/auth/index.ts` |
+
+### 13.2 用户账号认证（云端）
+
+**源码位置**: `packages/console/function/src/auth.ts`
+
+使用 OpenAuth 框架，支持 GitHub、Google OAuth：
+
+```typescript
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const result = await issuer({
-      theme: MY_THEME,
       providers: {
         github: GithubProvider({
           clientID: Resource.GITHUB_CLIENT_ID_CONSOLE.value,
@@ -829,12 +1563,28 @@ export default {
           scopes: ["openid", "email"],
         }),
       },
-      storage: CloudflareStorage({ namespace: env.AuthStorage }),
-      subjects,
-      async success(ctx, response) {
-        // 登录成功后处理：创建/获取账号、关联 workspace 等
-        // ...
-        return ctx.subject("account", accountID, { accountID, email })
+      storage: D1Adapter(env.DB),
+      subject: async (type, properties) => {
+        // 查找或创建用户账号
+        const existing = await db.query.AuthTable.findFirst({
+          where: and(
+            eq(AuthTable.provider, type),
+            eq(AuthTable.subject, properties.subject)
+          ),
+        });
+        if (existing) return existing.accountID;
+        // 创建新账号
+        const accountID = createId();
+        await db.insert(AuthTable).values({
+          provider: type,
+          subject: properties.subject,
+          accountID,
+        });
+        return accountID;
+      },
+      success: async (ctx, value) => {
+        // 设置 cookie 并重定向
+        return ctx.redirect(value.redirectURI);
       },
     }).fetch(request, env, ctx)
     return result
@@ -842,72 +1592,60 @@ export default {
 }
 ```
 
-**如果要添加自定义用户认证（需修改源码）**：
+**数据库 Schema**:
+
+```typescript
+// packages/console/core/src/schema/auth.sql.ts
+export const AuthProvider = ["email", "github", "google"] as const
+
+export const AuthTable = mysqlTable("auth", {
+  id: id(),
+  provider: mysqlEnum("provider", AuthProvider).notNull(),
+  subject: varchar("subject", { length: 255 }).notNull(),
+  accountID: ulid("account_id").notNull(),
+})
+```
+
+**扩展方式**: 需修改源码
 
 | 修改文件 | 修改内容 |
 |---------|---------|
 | `packages/console/function/src/auth.ts` | 添加新的 Provider（如 LDAP、企业 SSO） |
 | `packages/console/core/src/schema/auth.sql.ts` | 扩展 `AuthProvider` 枚举 |
-| `packages/console/app/src/routes/auth/` | 添加前端认证路由 |
 
-#### 10.1.2 OpenCode CLI 本地服务
+### 13.3 本地服务认证
 
-**源码位置**：
-- `packages/opencode/src/server/server.ts` - HTTP Server（第 80-85 行）
-- `packages/opencode/src/auth/index.ts` - 本地认证存储
-
-**Server Basic Auth 中间件（真实源码）**：
+**源码位置**: `packages/opencode/src/server/server.ts` 第 80-85 行
 
 ```typescript
-// packages/opencode/src/server/server.ts 第 80-85 行
 .use((c, next) => {
   const password = Flag.OPENCODE_SERVER_PASSWORD
-  if (!password) return next()  // 未设置密码则跳过认证
+  if (!password) return next()
   const username = Flag.OPENCODE_SERVER_USERNAME ?? "opencode"
   return basicAuth({ username, password })(c, next)
 })
 ```
 
-**启用本地服务认证**：
+**扩展方式**: 环境变量（无需修改源码）
 
 ```bash
-# 方式 1：环境变量
 export OPENCODE_SERVER_PASSWORD="your-password"
-export OPENCODE_SERVER_USERNAME="admin"  # 可选，默认 "opencode"
-
-# 方式 2：启动参数
-opencode serve --password "your-password" --username "admin"
+export OPENCODE_SERVER_USERNAME="admin"
 ```
 
-**如果要实现更复杂的本地认证（需修改源码）**：
+如需更复杂的认证（如 JWT），需修改 `packages/opencode/src/server/server.ts`。
 
-| 修改文件 | 修改内容 |
-|---------|---------|
-| `packages/opencode/src/server/server.ts` | 添加新的认证中间件 |
-| `packages/opencode/src/flag/flag.ts` | 添加新的 Flag 参数 |
+### 13.4 Provider 认证
 
-### 10.2 Provider 认证（API Key / OAuth）
-
-这部分是 OpenCode **本地存储** LLM Provider 的认证信息（如 OpenAI API Key）。
-
-**源码位置**：
-- `packages/opencode/src/auth/index.ts` - 认证信息存储
-- `packages/opencode/src/cli/cmd/auth.ts` - CLI 认证命令
-- `packages/opencode/src/provider/auth.ts` - Provider 认证处理
-- `packages/plugin/src/index.ts` - 插件 AuthHook 类型定义
-
-**本地认证存储（真实源码）**：
+**源码位置**: `packages/opencode/src/auth/index.ts`
 
 ```typescript
-// packages/opencode/src/auth/index.ts
 export namespace Auth {
-  // 认证信息类型
   export const Oauth = z.object({
     type: z.literal("oauth"),
     refresh: z.string(),
     access: z.string(),
     expires: z.number(),
-    accountId: z.string().optional(),
   })
 
   export const Api = z.object({
@@ -915,99 +1653,38 @@ export namespace Auth {
     key: z.string(),
   })
 
-  export const WellKnown = z.object({
-    type: z.literal("wellknown"),
-    key: z.string(),
-    token: z.string(),
-  })
-
-  export const Info = z.discriminatedUnion("type", [Oauth, Api, WellKnown])
-
   // 存储路径: ~/.local/share/opencode/auth.json
   const filepath = path.join(Global.Path.data, "auth.json")
-
-  export async function get(providerID: string) { /* ... */ }
-  export async function all(): Promise<Record<string, Info>> { /* ... */ }
-  export async function set(key: string, info: Info) { /* ... */ }
-  export async function remove(key: string) { /* ... */ }
 }
 ```
 
-### 10.3 AuthHook 类型定义（插件扩展 Provider 认证）
-
-**源码位置**: `packages/plugin/src/index.ts`
+**扩展方式**: 插件 `auth` hook（无需修改源码）
 
 ```typescript
-export type AuthHook = {
-  provider: string  // Provider ID，如 "openai", "anthropic"
-  
-  // 可选的 loader，用于自定义加载认证信息
-  loader?: (auth: () => Promise<Auth>, provider: Provider) => Promise<Record<string, any>>
-  
-  // 认证方法数组
-  methods: (
-    | {
-        type: "oauth"
-        label: string
-        prompts?: Array<{ type: "text" | "select"; key: string; message: string; /* ... */ }>
-        authorize(inputs?: Record<string, string>): Promise<AuthOauthResult>
-      }
-    | {
-        type: "api"
-        label: string
-        prompts?: Array<{ type: "text" | "select"; key: string; message: string; /* ... */ }>
-        authorize?(inputs?: Record<string, string>): Promise<
-          | { type: "success"; key: string; provider?: string }
-          | { type: "failed" }
-        >
-      }
-  )[]
-}
-```
-
-### 10.4 通过插件扩展 Provider 认证
-
-**插件可以通过 `auth` hook 添加自定义 Provider 认证方式**（无需修改源码）：
-
-```typescript
-import type { Plugin, Hooks, AuthHook } from "@opencode-ai/plugin";
-
 const MyAuthPlugin: Plugin = async (ctx): Promise<Hooks> => {
   return {
     auth: {
-      provider: "my-custom-provider",  // Provider ID
-      
+      provider: "my-provider",
       methods: [
-        // OAuth 方式
         {
           type: "oauth",
           label: "Login with My Service",
-          async authorize(inputs) {
+          async authorize() {
             return {
-              url: "https://my-auth.com/oauth/authorize?...",
-              instructions: "Please complete authorization in browser",
+              url: "https://my-auth.com/authorize",
               method: "auto",
               async callback() {
-                const token = await waitForAuthCallback();
-                return {
-                  type: "success",
-                  access: token.access_token,
-                  refresh: token.refresh_token,
-                  expires: Date.now() + token.expires_in * 1000,
-                };
+                return { type: "success", access: "xxx", refresh: "xxx", expires: Date.now() + 3600000 };
               },
             };
           },
         },
-        // API Key 方式
         {
           type: "api",
           label: "Enter API Key",
-          prompts: [{ type: "text", key: "apiKey", message: "Enter your API key:" }],
+          prompts: [{ type: "text", key: "apiKey", message: "Enter API key:" }],
           async authorize(inputs) {
-            const apiKey = inputs?.apiKey;
-            if (!apiKey) return { type: "failed" };
-            return { type: "success", key: apiKey };
+            return { type: "success", key: inputs?.apiKey || "" };
           },
         },
       ],
@@ -1016,100 +1693,66 @@ const MyAuthPlugin: Plugin = async (ctx): Promise<Hooks> => {
 };
 ```
 
-### 10.5 认证扩展总结
+---
 
-| 认证类型 | 扩展方式 | 需修改源码位置 |
-|---------|---------|--------------|
-| **用户账号（云端）** | 修改源码 | `packages/console/function/src/auth.ts` |
-| **本地服务 Basic Auth** | 环境变量 | 无需修改 |
-| **本地服务自定义认证** | 修改源码 | `packages/opencode/src/server/server.ts` |
-| **Provider API Key/OAuth** | **插件 `auth` hook** | **无需修改** |
+## 14. Provider 扩展
 
-### 10.3 认证配置方式
+### 14.1 配置已有 Provider
 
-**方式 1：环境变量**
+**方式 1: 配置文件**
 
-```bash
-# API Key 方式
-export OPENAI_API_KEY="sk-xxx"
-export ANTHROPIC_API_KEY="sk-ant-xxx"
-export GOOGLE_API_KEY="xxx"
-
-# 自定义认证服务器
-export MY_AUTH_SERVER_URL="https://auth.example.com"
-export MY_AUTH_CLIENT_ID="xxx"
-export MY_AUTH_CLIENT_SECRET="xxx"
-```
-
-**方式 2：配置文件** (`~/.opencode/auth.json`)
-
-```json
+```jsonc
 {
-  "providers": {
+  "provider": {
     "openai": {
-      "apiKey": "sk-xxx"
-    },
-    "anthropic": {
-      "apiKey": "sk-ant-xxx"
-    },
-    "my-custom-provider": {
-      "accessToken": "xxx",
-      "refreshToken": "xxx",
-      "expiresAt": 1234567890
+      "options": {
+        "apiKey": "sk-xxx",
+        "baseURL": "https://api.openai.com/v1",
+        "timeout": 60000
+      },
+      "whitelist": ["gpt-4o", "gpt-4o-mini"],
+      "blacklist": ["gpt-3.5-turbo"]
     }
   }
 }
 ```
 
-**方式 3：CLI 命令**
+**方式 2: 环境变量**
 
 ```bash
-# 登录指定 provider
-opencode auth login openai
-opencode auth login github
-opencode auth login my-custom-auth
-
-# 查看认证状态
-opencode auth status
-
-# 登出
-opencode auth logout openai
+export OPENAI_API_KEY="sk-xxx"
+export OPENAI_BASE_URL="https://api.openai.com/v1"
 ```
 
-### 10.4 认证 API 路由
-
-**文件位置**: `opencode-dev/packages/opencode/src/server/routes/provider.ts`
+**方式 3: 插件 config hook**
 
 ```typescript
-// 认证相关 API
-GET  /provider/auth              // 获取所有可用的认证方法
-POST /provider/:id/oauth/authorize  // 发起 OAuth 授权
-POST /provider/:id/oauth/callback   // OAuth 回调
-POST /provider/:id/refresh          // 刷新 token
+config: async (config) => {
+  config.provider = {
+    ...config.provider,
+    "openai": {
+      ...config.provider?.["openai"],
+      options: {
+        apiKey: process.env.MY_API_KEY,
+        baseURL: "https://my-proxy.com/v1",
+      },
+    },
+  };
+}
 ```
 
----
+### 14.2 添加新的 Provider SDK
 
-## 十一、自定义推理服务（Provider）
-
-### 11.1 Provider 架构
-
-**源码位置**：
-- `packages/opencode/src/provider/provider.ts` - Provider 核心实现
-- `packages/opencode/src/provider/models.ts` - models.dev 模型目录
-- `packages/opencode/src/config/config.ts` - Provider 配置 Schema
-
-**内置 AI SDK Provider（真实源码）**：
+**需修改源码**: `packages/opencode/src/provider/provider.ts`
 
 ```typescript
-// packages/opencode/src/provider/provider.ts 第 56-79 行
+// 在 BUNDLED_PROVIDERS 中添加
 const BUNDLED_PROVIDERS: Record<string, (options: any) => SDK> = {
   "@ai-sdk/amazon-bedrock": createAmazonBedrock,
   "@ai-sdk/anthropic": createAnthropic,
   "@ai-sdk/azure": createAzure,
   "@ai-sdk/google": createGoogleGenerativeAI,
   "@ai-sdk/google-vertex": createVertex,
-  "@ai-sdk/google-vertex/anthropic": createVertexAnthropic,
   "@ai-sdk/openai": createOpenAI,
   "@ai-sdk/openai-compatible": createOpenAICompatible,
   "@openrouter/ai-sdk-provider": createOpenRouter,
@@ -1119,491 +1762,187 @@ const BUNDLED_PROVIDERS: Record<string, (options: any) => SDK> = {
   "@ai-sdk/deepinfra": createDeepInfra,
   "@ai-sdk/cerebras": createCerebras,
   "@ai-sdk/cohere": createCohere,
-  "@ai-sdk/gateway": createGateway,
   "@ai-sdk/togetherai": createTogetherAI,
   "@ai-sdk/perplexity": createPerplexity,
   "@ai-sdk/vercel": createVercel,
   "@gitlab/gitlab-ai-provider": createGitLab,
-  "@ai-sdk/github-copilot": createGitHubCopilotOpenAICompatible,
+  "@my-ai-sdk/my-provider": createMyProvider,  // 新增自定义 Provider
 }
 ```
 
-**模型来源**（models.dev）：
+同时需要在 `packages/opencode/package.json` 中添加依赖。
 
-```typescript
-// packages/opencode/src/provider/models.ts
-export namespace ModelsDev {
-  export const Provider = z.object({
-    api: z.string().optional(),
-    name: z.string(),
-    env: z.array(z.string()),  // 环境变量名，如 ["OPENAI_API_KEY"]
-    id: z.string(),
-    npm: z.string().optional(), // AI SDK 包名
-    models: z.record(z.string(), Model),
-  })
-  
-  // 从 https://models.dev/api.json 获取模型数据
-  export async function get() { /* ... */ }
-}
+### 14.3 自定义推理服务（详细）
+
+OpenCode 支持接入自定义的 LLM 推理服务，常见场景包括私有部署的 vLLM、TGI、Ollama 等。
+
+#### 方式 1: 环境变量（OpenAI 兼容接口）
+
+对于兼容 OpenAI API 的服务（如 vLLM、TGI、LocalAI、Ollama）：
+
+```bash
+# 指向自定义服务
+export OPENAI_API_KEY="EMPTY"          # 如果不需要认证可设为任意值
+export OPENAI_BASE_URL="http://localhost:8000/v1"
 ```
 
-**如果要添加全新的 Provider SDK（需修改源码）**：
+#### 方式 2: 配置文件
 
-| 修改文件 | 修改内容 |
-|---------|---------|
-| `packages/opencode/src/provider/provider.ts` | 在 `BUNDLED_PROVIDERS` 中添加新的 SDK |
-| `packages/opencode/package.json` | 添加新 SDK 依赖 |
-
-### 11.2 配置自定义 Provider
-
-**文件位置**: `opencode-dev/packages/opencode/src/config/config.ts`
-
-**Provider 配置 Schema（真实源码）：**
-
-```typescript
-export const Provider = ModelsDev.Provider.partial().extend({
-  // 过滤模型
-  whitelist: z.array(z.string()).optional(),  // 只启用这些模型
-  blacklist: z.array(z.string()).optional(),  // 禁用这些模型
-  
-  // 自定义模型配置
-  models: z.record(z.string(), /* Model 配置 */).optional(),
-  
-  // Provider 选项
-  options: z.object({
-    apiKey: z.string().optional(),
-    baseURL: z.string().optional(),
-    enterpriseUrl: z.string().optional(),  // GitHub Enterprise URL
-    timeout: z.number().optional(),         // 请求超时（毫秒）
-  }).catchall(z.any()).optional(),
-})
-```
-
-**方式 1：配置文件** (`opencode.jsonc`)
+**源码位置**: `packages/opencode/src/config/config.ts` 第 868-919 行
 
 ```jsonc
+// opencode.jsonc
 {
   "provider": {
-    // 配置内置 Provider（覆盖默认设置）
     "openai": {
       "options": {
-        "apiKey": "sk-xxx",
-        "baseURL": "https://api.openai.com/v1",
+        "apiKey": "EMPTY",
+        "baseURL": "http://localhost:8000/v1",
         "timeout": 60000
       },
-      // 只启用特定模型
-      "whitelist": ["gpt-4o", "gpt-4o-mini"],
-      // 或禁用特定模型
-      "blacklist": ["gpt-3.5-turbo"]
-    },
-    
-    // 配置 Anthropic
-    "anthropic": {
-      "options": {
-        "apiKey": "sk-ant-xxx",
-        "baseURL": "https://api.anthropic.com"
-      }
-    },
-    
-    // 自定义模型配置
-    "openai": {
+      // 自定义模型列表
       "models": {
-        "gpt-4o": {
-          "name": "GPT-4o (Custom)",
+        "my-local-model": {
+          "name": "My Local Model",
+          "release_date": "2024-01-01",
+          "attachment": false,
+          "reasoning": false,
+          "temperature": true,
+          "tool_call": true,
           "limit": {
-            "context": 128000,
-            "output": 16384
+            "context": 32000,
+            "output": 4096
           }
         }
       }
     }
   },
-  
-  // 禁用某些 Provider（全局）
-  "disabled_providers": ["azure", "bedrock"],
-  
-  // 只启用特定 Provider（全局）
-  "enabled_providers": ["openai", "anthropic"]
+  "model": "openai/my-local-model"
 }
 ```
 
-**方式 2：环境变量**
+#### 方式 3: 使用 openai-compatible Provider
 
-```bash
-# 标准 Provider
-export OPENAI_API_KEY="sk-xxx"
-export OPENAI_BASE_URL="https://api.openai.com/v1"
-
-export ANTHROPIC_API_KEY="sk-ant-xxx"
-export ANTHROPIC_BASE_URL="https://api.anthropic.com"
-
-# 自定义 Provider
-export MY_LLM_API_KEY="xxx"
-export MY_LLM_BASE_URL="https://my-llm-service.com/v1"
-```
-
-### 11.3 通过插件配置 Provider
-
-**注意**：OpenCode 的 Provider 基于 AI SDK，自定义 Provider 需要通过现有的 SDK 包（如 `@ai-sdk/openai`）。
-
-```typescript
-import type { Plugin, Hooks } from "@opencode-ai/plugin";
-
-const MyProviderPlugin: Plugin = async (ctx): Promise<Hooks> => {
-  return {
-    config: async (config) => {
-      // 配置已有 Provider 的选项
-      config.provider = {
-        ...config.provider,
-        
-        // 方式 1：配置 OpenAI 兼容服务（复用 openai provider）
-        "openai": {
-          ...config.provider?.["openai"],
-          options: {
-            ...config.provider?.["openai"]?.options,
-            apiKey: process.env.MY_API_KEY || config.provider?.["openai"]?.options?.apiKey,
-            baseURL: process.env.MY_BASE_URL || "https://api.my-service.com/v1",
-          },
-        },
-        
-        // 方式 2：通过 whitelist/blacklist 控制可用模型
-        "anthropic": {
-          ...config.provider?.["anthropic"],
-          whitelist: ["claude-sonnet-4-20250514", "claude-haiku-3-5-20241022"],
-        },
-      };
-      
-      // 禁用不需要的 Provider
-      config.disabled_providers = [
-        ...(config.disabled_providers || []),
-        "azure",
-        "bedrock",
-      ];
-    },
-  };
-};
-```
-
-**重要说明**：
-- OpenCode 不支持动态注册全新的 Provider SDK
-- 自定义推理服务需要兼容现有 SDK 协议（OpenAI、Anthropic 等）
-- 通过 `options.baseURL` 指向自定义服务端点
-
-### 11.4 Provider API 路由
-
-```typescript
-// Provider 相关 API
-GET  /provider/                    // 列出所有可用 Provider
-GET  /provider/:id/models          // 获取 Provider 的模型列表
-POST /provider/:id/chat            // 发送聊天请求
-```
-
-### 11.5 自定义推理服务示例
-
-如果你有自己的推理服务（如 vLLM、TGI、Ollama 等），需要通过复用已有 Provider 来配置：
+**源码位置**: `packages/opencode/src/provider/provider.ts` 第 64 行
 
 ```jsonc
 {
   "provider": {
-    // vLLM 服务 - 使用 OpenAI 兼容协议
-    // 注意：需要复用 "openai" provider，或使用环境变量
-    "openai": {
-      "options": {
-        "apiKey": "EMPTY",  // vLLM 通常不需要 key
-        "baseURL": "http://localhost:8000/v1"
+    "my-custom-llm": {
+      "npm": "@ai-sdk/openai-compatible",
+      "api": "http://localhost:8000/v1",
+      "env": ["MY_CUSTOM_API_KEY"],
+      "models": {
+        "llama3-70b": {
+          "name": "Llama 3 70B",
+          "release_date": "2024-01-01",
+          "tool_call": true,
+          "limit": { "context": 8192, "output": 2048 }
+        }
       }
     }
   }
 }
 ```
 
-**使用环境变量配置自定义服务**（推荐）：
-
-```bash
-# OpenAI 兼容服务（vLLM、TGI 等）
-export OPENAI_API_KEY="EMPTY"
-export OPENAI_BASE_URL="http://localhost:8000/v1"
-
-# 或 Anthropic 兼容服务
-export ANTHROPIC_API_KEY="xxx"
-export ANTHROPIC_BASE_URL="https://my-proxy.com/anthropic"
-```
-
-**Ollama 配置**（OpenCode 内置支持）：
-
-```bash
-# Ollama 已经是内置支持的 Provider
-# 只需确保 Ollama 服务运行即可
-ollama serve
-```
-
-**重要说明**：
-- OpenCode 的 Provider 体系基于 [models.dev](https://models.dev) 的模型目录
-- 自定义服务需要兼容现有 Provider 的 API 协议
-- 对于完全自定义的 Provider，建议通过 MCP Server 方式接入
-
----
-
-## 十二、Codebase 对接
-
-### 12.1 内置代码搜索工具
-
-**文件位置**: `opencode-dev/packages/opencode/src/tool/codesearch.ts`
-
-OpenCode 内置了 `codesearch` 工具，使用 Exa MCP API 进行**外部**代码/文档搜索：
+#### 方式 4: 插件动态配置
 
 ```typescript
-// 真实源码
-const API_CONFIG = {
-  BASE_URL: "https://mcp.exa.ai",
-  ENDPOINTS: {
-    CONTEXT: "/mcp",
-  },
-}
-
-export const CodeSearchTool = Tool.define("codesearch", {
-  description: DESCRIPTION,  // 搜索 API、库和 SDK 的相关文档
-  parameters: z.object({
-    query: z.string().describe(
-      "Search query to find relevant context for APIs, Libraries, and SDKs. " +
-      "For example, 'React useState hook examples', 'Python pandas dataframe filtering'"
-    ),
-    tokensNum: z.number().min(1000).max(50000).default(5000).describe(
-      "Number of tokens to return (1000-50000). Default is 5000 tokens."
-    ),
-  }),
-  async execute(params, ctx) {
-    await ctx.ask({
-      permission: "codesearch",
-      patterns: [params.query],
-      always: ["*"],
-    });
-
-    const codeRequest = {
-      jsonrpc: "2.0",
-      id: 1,
-      method: "tools/call",
-      params: {
-        name: "get_code_context_exa",  // Exa API 工具名
-        arguments: {
-          query: params.query,
-          tokensNum: params.tokensNum || 5000,
-        },
-      },
-    };
-
-    const response = await fetch(`${API_CONFIG.BASE_URL}${API_CONFIG.ENDPOINTS.CONTEXT}`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(codeRequest),
-    });
-    // ... 解析 SSE 响应
-  },
-});
-```
-
-**注意**：`codesearch` 工具是用于搜索**外部**代码库和文档（如 GitHub、npm 包文档等），而不是搜索**本地**项目代码。本地代码搜索使用 `grep`、`glob`、`read` 等工具。
-
-### 12.2 通过插件扩展 Codebase 能力（无需修改源码）
-
-**自定义代码索引和搜索工具：**
-
-```typescript
-import type { Plugin, Hooks } from "@opencode-ai/plugin";
-import { tool } from "@opencode-ai/plugin";
-import z from "zod";
-
-const MyCodebasePlugin: Plugin = async (ctx): Promise<Hooks> => {
+const CustomProviderPlugin: Plugin = async (ctx): Promise<Hooks> => {
   return {
-    tool: {
-      // 自定义代码搜索工具
-      my_code_search: tool({
-        description: "使用自定义代码库搜索引擎查找相关代码",
-        parameters: z.object({
-          query: z.string().describe("搜索查询"),
-          limit: z.number().optional().describe("返回结果数量"),
-        }),
-        async execute(args, context) {
-          const response = await fetch("http://my-codebase-service/search", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              query: args.query,
-              project: context.directory,
-              limit: args.limit || 10,
-            }),
-          });
-          const results = await response.json();
-          return {
-            output: JSON.stringify(results, null, 2),
-            title: `代码搜索: ${args.query}`,
-            metadata: {},
-          };
-        },
-      }),
+    config: async (config) => {
+      // 动态获取可用模型
+      const models = await fetchAvailableModels("http://localhost:8000");
       
-      // 代码嵌入索引工具
-      index_codebase: tool({
-        description: "为当前项目创建代码嵌入索引",
-        parameters: z.object({
-          force: z.boolean().optional().describe("强制重新索引"),
-        }),
-        async execute(args, context) {
-          await fetch("http://my-codebase-service/index", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              directory: context.directory,
-              force: args.force || false,
-            }),
-          });
-          return {
-            output: "索引创建完成",
-            title: "代码索引",
-            metadata: {},
-          };
+      config.provider = {
+        ...config.provider,
+        "my-llm": {
+          npm: "@ai-sdk/openai-compatible",
+          api: "http://localhost:8000/v1",
+          models: models,
+          options: {
+            apiKey: process.env.MY_LLM_KEY || "EMPTY",
+          },
         },
-      }),
+      };
     },
   };
 };
 ```
 
-**如果要修改/替换内置 CodeSearch 工具（需修改源码）**：
+#### 模型数据来源
 
-| 修改文件 | 修改内容 |
-|---------|---------|
-| `packages/opencode/src/tool/codesearch.ts` | 修改搜索逻辑、API 地址 |
-| `packages/opencode/src/tool/registry.ts` | 第 115 行，工具注册列表 |
+**源码位置**: `packages/opencode/src/provider/models.ts`
 
-### 12.3 通过 MCP 对接 Codebase
+OpenCode 默认从 `https://models.dev/api.json` 获取模型列表，缓存在 `~/.local/share/opencode/models.json`。
 
-**配置 MCP Server：**
+```typescript
+// packages/opencode/src/provider/models.ts 第 83-99 行
+export const Data = lazy(async () => {
+  const file = Bun.file(Flag.OPENCODE_MODELS_PATH ?? filepath)
+  const result = await file.json().catch(() => {})
+  if (result) return result
+  // 尝试使用打包的快照
+  const snapshot = await import("./models-snapshot")
+    .then((m) => m.snapshot as Record<string, unknown>)
+    .catch(() => undefined)
+  if (snapshot) return snapshot
+  // 从 models.dev 获取
+  if (Flag.OPENCODE_DISABLE_MODELS_FETCH) return {}
+  const json = await fetch(`${url()}/api.json`).then((x) => x.text())
+  return JSON.parse(json)
+})
+```
 
-```jsonc
-{
-  "mcp": {
-    // 自定义代码搜索 MCP
-    "my-codebase": {
-      "type": "sse",
-      "url": "http://localhost:8000/mcp/sse"
-    },
-    
-    // 或者使用 stdio 方式
-    "my-codebase-stdio": {
-      "type": "stdio",
-      "command": "python",
-      "args": ["-m", "my_codebase_mcp"]
-    }
-  }
+可通过以下方式自定义：
+
+```bash
+# 禁用自动获取
+export OPENCODE_DISABLE_MODELS_FETCH=true
+
+# 自定义模型数据路径
+export OPENCODE_MODELS_PATH="/path/to/my/models.json"
+
+# 自定义模型数据源 URL
+export OPENCODE_MODELS_URL="https://my-company.com/models"
+```
+
+#### 添加新的 AI SDK
+
+**需修改源码**: 如果要添加不兼容 OpenAI 的新 Provider SDK
+
+修改位置: `packages/opencode/src/provider/provider.ts` 第 56-79 行
+
+```typescript
+// 添加新的 SDK 到 BUNDLED_PROVIDERS
+const BUNDLED_PROVIDERS: Record<string, (options: any) => SDK> = {
+  "@ai-sdk/amazon-bedrock": createAmazonBedrock,
+  "@ai-sdk/anthropic": createAnthropic,
+  "@ai-sdk/azure": createAzure,
+  "@ai-sdk/google": createGoogleGenerativeAI,
+  "@ai-sdk/google-vertex": createVertex,
+  "@ai-sdk/openai": createOpenAI,
+  "@ai-sdk/openai-compatible": createOpenAICompatible,
+  "@my-ai-sdk/my-provider": createMyProvider,  // 新增
 }
 ```
 
-**MCP Server 实现示例（Python）：**
-
-```python
-from mcp.server import Server
-from mcp.types import Tool, TextContent
-
-app = Server("my-codebase")
-
-@app.list_tools()
-async def list_tools():
-    return [
-        Tool(
-            name="search_code",
-            description="搜索代码库",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "limit": {"type": "number"},
-                },
-                "required": ["query"],
-            },
-        ),
-    ]
-
-@app.call_tool()
-async def call_tool(name: str, arguments: dict):
-    if name == "search_code":
-        results = await search_codebase(arguments["query"])
-        return [TextContent(type="text", text=json.dumps(results))]
-```
+同时在 `packages/opencode/package.json` 中添加依赖。
 
 ---
 
-## 十三、自定义 Agent 市场应用列表
+## 15. Agent 扩展
 
-### 13.1 Agent 系统架构
-
-**文件位置**: 
-- 运行时定义: `opencode-dev/packages/opencode/src/agent/agent.ts`
-- 配置定义: `opencode-dev/packages/opencode/src/config/config.ts`
-
-**Agent 运行时定义（真实源码）：**
-
-```typescript
-// opencode-dev/packages/opencode/src/agent/agent.ts
-export namespace Agent {
-  export const Info = z.object({
-    name: z.string(),
-    description: z.string().optional(),
-    mode: z.enum(["subagent", "primary", "all"]),
-    native: z.boolean().optional(),       // 是否内置 Agent
-    hidden: z.boolean().optional(),       // 是否隐藏
-    topP: z.number().optional(),
-    temperature: z.number().optional(),
-    color: z.string().optional(),
-    permission: PermissionNext.Ruleset,
-    model: z.object({
-      modelID: z.string(),
-      providerID: z.string(),
-    }).optional(),
-    variant: z.string().optional(),
-    prompt: z.string().optional(),
-    options: z.record(z.string(), z.any()),
-    steps: z.number().int().positive().optional(),  // 最大迭代步数
-  });
-}
-```
-
-**Agent 配置定义（用户配置）：**
-
-```typescript
-// opencode-dev/packages/opencode/src/config/config.ts
-export const Agent = z.object({
-  model: z.string().optional(),             // 格式: "provider/model"
-  variant: z.string().optional(),           // 模型变体
-  temperature: z.number().optional(),
-  top_p: z.number().optional(),
-  prompt: z.string().optional(),            // System prompt
-  description: z.string().optional(),       // Agent 描述
-  mode: z.enum(["subagent", "primary", "all"]).optional(),
-  hidden: z.boolean().optional(),           // 是否在菜单中隐藏
-  color: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
-  steps: z.number().int().positive().optional(),
-  permission: Permission.optional(),        // 权限配置
-  options: z.record(z.string(), z.any()).optional(),
-  disable: z.boolean().optional(),          // 禁用此 Agent
-});
-```
-
-### 13.2 两条路径：配置文件 vs 插件扩展
-
-#### 路径 1：配置文件方式（无需开发）
-
-直接在 `opencode.jsonc` 中定义 Agent：
+### 15.1 配置文件方式
 
 ```jsonc
 {
   "agent": {
-    // 自定义主 Agent（可直接使用）
-    "code-reviewer": {
-      "description": "专业代码审查专家",
+    "my-reviewer": {
+      "description": "代码审查专家",
       "mode": "primary",
-      "model": "anthropic/claude-sonnet-4-20250514",  // 格式: provider/model-id
-      "prompt": "你是一个专业的代码审查专家，专注于代码质量、安全性和最佳实践...",
+      "model": "anthropic/claude-sonnet-4-20250514",
+      "prompt": "你是一个专业的代码审查专家，擅长发现代码中的问题、安全漏洞和性能隐患。请仔细审查代码，提供建设性的反馈。",
       "temperature": 0.3,
       "permission": {
         "read": "allow",
@@ -1611,30 +1950,355 @@ export const Agent = z.object({
         "bash": "deny"
       },
       "color": "#FF6B6B"
+    }
+  },
+  "default_agent": "my-reviewer"
+}
+```
+
+### 15.2 插件方式（动态加载）
+
+```typescript
+const MyAgentPlugin: Plugin = async (ctx): Promise<Hooks> => {
+  // 可以从远程获取 Agent 列表
+  const agents = await fetch("https://api.example.com/agents").then(r => r.json());
+  
+  return {
+    config: async (config) => {
+      config.agent = {
+        ...config.agent,
+        ...agents.reduce((acc, a) => ({
+          ...acc,
+          [a.id]: {
+            description: a.description,
+            mode: a.mode,
+            model: a.model,
+            prompt: a.systemPrompt,
+            permission: a.permissions,
+          },
+        }), {}),
+      };
     },
-    
-    // 覆盖内置 Agent 配置
-    "build": {
-      "model": "anthropic/claude-sonnet-4-20250514",
-      "temperature": 0.5
+  };
+};
+```
+
+### 15.3 修改内置 Agent
+
+**需修改源码**: `packages/opencode/src/agent/agent.ts`
+
+---
+
+## 16. 工具扩展
+
+### 16.1 插件方式（推荐）
+
+```typescript
+tool: {
+  my_search: tool({
+    description: "搜索代码库",
+    args: {
+      query: tool.schema.string().describe("搜索查询"),
+      limit: tool.schema.number().optional().describe("结果数量"),
     },
-    
-    // 自定义子 Agent（只能被其他 Agent 调用）
-    "quick-fixer": {
-      "description": "快速修复助手，用于简单的代码修复任务",
-      "mode": "subagent",
-      "model": "openai/gpt-4o-mini",
-      "prompt": "你是一个快速修复问题的助手，专注于简单、快速的修复...",
-      "permission": {
-        "edit": "allow",
-        "bash": "ask"
+    async execute(args, ctx) {
+      const results = await searchCodebase(args.query, ctx.directory);
+      return JSON.stringify(results);
+    },
+  }),
+}
+```
+
+### 16.2 .opencode/tool 目录
+
+在项目或用户目录的 `.opencode/tool/` 下创建工具文件。
+
+### 16.3 修改内置工具
+
+**需修改源码**: `packages/opencode/src/tool/`
+
+| 文件 | 说明 |
+|------|------|
+| `registry.ts` | 工具注册列表 |
+| `edit.ts` | Edit 工具 |
+| `bash.ts` | Bash 工具 |
+| `codesearch.ts` | CodeSearch 工具 |
+
+---
+
+## 17. MCP 扩展
+
+### 17.1 配置 MCP Server
+
+```jsonc
+{
+  "mcp": {
+    "my-mcp": {
+      "type": "local",
+      "command": ["python", "-m", "my_mcp_server"],
+      "environment": { "API_KEY": "xxx" }
+    },
+    "remote-mcp": {
+      "type": "remote",
+      "url": "https://mcp.example.com/sse"
+    }
+  }
+}
+```
+
+### 17.2 插件方式
+
+```typescript
+config: async (config) => {
+  config.mcp = {
+    ...config.mcp,
+    "my-mcp": {
+      type: "local",
+      command: ["node", "my-mcp-server.js"],
+    },
+  };
+}
+```
+
+---
+
+## 18. Codebase 对接
+
+### 18.1 内置代码搜索工具
+
+**源码位置**: `packages/opencode/src/tool/codesearch.ts`
+
+OpenCode 内置的 `codesearch` 工具用于搜索**外部代码库和文档**（通过 Exa API），而非本地项目代码：
+
+```typescript
+// packages/opencode/src/tool/codesearch.ts 第 35-51 行
+export const CodeSearchTool = Tool.define("codesearch", {
+  description: DESCRIPTION,
+  parameters: z.object({
+    query: z
+      .string()
+      .describe(
+        "Search query to find relevant context for APIs, Libraries, and SDKs. " +
+        "For example, 'React useState hook examples', 'Python pandas dataframe filtering'",
+      ),
+    tokensNum: z
+      .number()
+      .min(1000)
+      .max(50000)
+      .default(5000)
+      .describe("Number of tokens to return (1000-50000)."),
+  }),
+  async execute(params, ctx) {
+    // 调用 Exa MCP 服务
+    const codeRequest = {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "tools/call",
+      params: {
+        name: "get_code_context_exa",
+        arguments: {
+          query: params.query,
+          tokensNum: params.tokensNum || 5000,
+        },
       },
-      "hidden": false  // 在 @ 菜单中显示
+    }
+    // 发送到 https://mcp.exa.ai/mcp
+    const response = await fetch(`${API_CONFIG.BASE_URL}${API_CONFIG.ENDPOINTS.CONTEXT}`, {
+      method: "POST",
+      body: JSON.stringify(codeRequest),
+    })
+
+    if (!response.ok) {
+      throw new Error(`Code search error (${response.status}): ${await response.text()}`)
+    }
+
+    // 解析 SSE 响应
+    const responseText = await response.text()
+    const lines = responseText.split("\n")
+    for (const line of lines) {
+      if (line.startsWith("data: ")) {
+        const data = JSON.parse(line.substring(6))
+        if (data.result?.content?.[0]?.text) {
+          return {
+            output: data.result.content[0].text,
+            title: `Code search: ${params.query}`,
+            metadata: {},
+          }
+        }
+      }
+    }
+
+    return {
+      output: "No code snippets or documentation found.",
+      title: `Code search: ${params.query}`,
+      metadata: {},
+    }
+  },
+})
+```
+
+**关键点**：`codesearch` 是外部搜索工具，用于查询 API 文档、库用法等。
+
+### 18.2 本地 Codebase 搜索
+
+本地代码库搜索依赖以下内置工具：
+
+| 工具 | 说明 | 源码位置 |
+|------|------|---------|
+| `grep` | 基于正则的代码搜索 | `packages/opencode/src/tool/grep.ts` |
+| `glob` | 文件模式匹配 | `packages/opencode/src/tool/glob.ts` |
+| `read` | 读取文件内容 | `packages/opencode/src/tool/read.ts` |
+| `list` | 列出目录 | `packages/opencode/src/tool/list.ts` |
+
+### 18.3 扩展本地代码库搜索
+
+#### 方式 1: 插件自定义工具
+
+```typescript
+const CodebasePlugin: Plugin = async (ctx): Promise<Hooks> => {
+  return {
+    tool: {
+      // 语义搜索
+      semantic_search: tool({
+        description: "基于语义的代码搜索，找到相关代码片段",
+        args: {
+          query: tool.schema.string().describe("搜索查询"),
+          limit: tool.schema.number().optional().default(10),
+        },
+        async execute(args, ctx) {
+          // 连接到本地向量数据库或搜索服务
+          const results = await fetch("http://localhost:6333/search", {
+            method: "POST",
+            body: JSON.stringify({
+              query: args.query,
+              cwd: ctx.directory,
+              limit: args.limit,
+            }),
+          }).then(r => r.json());
+          return JSON.stringify(results);
+        },
+      }),
+
+      // 代码索引
+      index_codebase: tool({
+        description: "索引当前代码库用于语义搜索",
+        args: {},
+        async execute(args, ctx) {
+          // 触发索引任务
+          await fetch("http://localhost:6333/index", {
+            method: "POST",
+            body: JSON.stringify({ path: ctx.directory }),
+          });
+          return "索引任务已启动";
+        },
+      }),
+    },
+  };
+};
+```
+
+#### 方式 2: MCP 集成代码索引服务
+
+```jsonc
+// opencode.jsonc
+{
+  "mcp": {
+    "codebase-mcp": {
+      "type": "local",
+      "command": ["python", "-m", "codebase_mcp_server"],
+      "environment": {
+        "CODEBASE_PATH": ".",
+        "VECTOR_DB_URL": "http://localhost:6333"
+      }
+    }
+  }
+}
+```
+
+#### 方式 3: 修改内置 codesearch 工具
+
+**需修改源码**: `packages/opencode/src/tool/codesearch.ts`
+
+将外部搜索改为本地搜索：
+
+```typescript
+// 修改 execute 函数
+async execute(params, ctx) {
+  // 改为调用本地搜索服务
+  const response = await fetch("http://localhost:8080/search", {
+    method: "POST",
+    body: JSON.stringify({
+      query: params.query,
+      cwd: ctx.directory,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Search error: ${await response.text()}`);
+  }
+
+  const results = await response.json();
+  return JSON.stringify(results);
+}
+```
+
+---
+
+## 19. Agent 市场对接
+
+### 19.1 概述
+
+OpenCode 支持两种方式对接自定义 Agent 市场：
+
+| 方式 | 修改源码 | 动态加载 | 适用场景 |
+|------|---------|---------|---------|
+| 直接配置 | 否 | 否 | 固定的 Agent 列表 |
+| 插件扩展 | 否 | 是 | 动态 Agent 市场 |
+
+### 19.2 直接对接（配置文件方式）
+
+**无需修改源码**，通过 `opencode.jsonc` 静态配置 Agent 列表：
+
+```jsonc
+// opencode.jsonc
+{
+  "agent": {
+    // Agent 1: 代码审查专家
+    "code-reviewer": {
+      "name": "Code Reviewer",
+      "description": "专业的代码审查和安全分析专家",
+      "mode": "primary",
+      "model": "anthropic/claude-sonnet-4-20250514",
+      "prompt": "你是一个专业的代码审查专家，擅长发现代码中的问题、安全漏洞和性能隐患。",
+      "permission": {
+        "read": "allow",
+        "edit": "deny",
+        "bash": "deny"
+      },
+      "color": "#E74C3C"
     },
     
-    // 禁用某个 Agent
-    "plan": {
-      "disable": true
+    // Agent 2: 文档生成器
+    "doc-generator": {
+      "name": "Doc Generator",
+      "description": "自动生成代码文档和 API 说明",
+      "mode": "primary",
+      "model": "openai/gpt-4o",
+      "prompt": "你是一个文档生成专家，能够根据代码生成清晰、准确的技术文档。",
+      "permission": {
+        "read": "allow",
+        "edit": { "*.md": "allow", "*": "deny" }
+      },
+      "color": "#3498DB"
+    },
+    
+    // Agent 3: 测试助手（subagent）
+    "test-helper": {
+      "name": "Test Helper",
+      "description": "生成单元测试和集成测试",
+      "mode": "subagent",
+      "prompt": "你是测试专家，擅长编写全面的单元测试和集成测试。",
+      "hidden": false
     }
   },
   
@@ -1643,327 +2307,303 @@ export const Agent = z.object({
 }
 ```
 
-**内置 Agent 列表**（可覆盖配置）：
-
-| Agent | 模式 | 说明 |
-|-------|------|------|
-| `build` | primary | 默认 Agent，执行工具 |
-| `plan` | primary | 计划模式，禁止编辑工具 |
-| `general` | subagent | 通用子 Agent，执行多步任务 |
-| `explore` | subagent | 快速探索代码库 |
-| `title` | hidden | 生成会话标题 |
-| `summary` | hidden | 生成摘要 |
-| `compaction` | hidden | 压缩会话上下文 |
-
-#### 路径 2：插件扩展方式（动态加载）
-
-通过插件的 `config` hook 注入 Agent：
+**Config.Agent Schema**（源码位置: `packages/opencode/src/config/config.ts` 第 593-623 行）：
 
 ```typescript
-import type { Plugin, Hooks } from "@opencode-ai/plugin";
-
-const MyAgentMarketPlugin: Plugin = async (ctx): Promise<Hooks> => {
-  // 插件加载时可以从远程获取 Agent 列表
-  let agentsFromMarket: Record<string, any> = {};
-  
-  try {
-    const response = await fetch("https://my-agent-market.com/api/agents");
-    const agentList = await response.json();
-    
-    // 转换为 OpenCode Agent 配置格式
-    agentsFromMarket = Object.fromEntries(
-      agentList.map((agent: any) => [
-        agent.id,
-        {
-          description: agent.description,
-          mode: agent.mode || "primary",  // "primary" | "subagent" | "all"
-          model: agent.model,             // 格式: "provider/model-id"
-          prompt: agent.systemPrompt,
-          temperature: agent.temperature,
-          permission: agent.permissions || { "*": "allow" },
-          color: agent.color,
-        },
-      ])
-    );
-  } catch (error) {
-    console.error("Failed to fetch agents from market:", error);
-  }
-  
-  return {
-    config: async (config) => {
-      // 合并 Agent 配置（注意：后面的会覆盖前面的同名 Agent）
-      config.agent = {
-        ...config.agent,           // 保留原有配置
-        ...agentsFromMarket,       // 添加市场 Agent
-      };
-      
-      // 可选：设置默认 Agent
-      if (agentsFromMarket["recommended-agent"]) {
-        (config as any).default_agent = "recommended-agent";
-      }
-    },
-  };
-};
-
-export default MyAgentMarketPlugin;
+export const Agent = z
+  .object({
+    model: z.string().optional(),
+    variant: z.string().optional(),
+    temperature: z.number().optional(),
+    top_p: z.number().optional(),
+    prompt: z.string().optional(),
+    disable: z.boolean().optional(),
+    description: z.string().optional(),
+    mode: z.enum(["subagent", "primary", "all"]).optional(),
+    hidden: z.boolean().optional(),
+    options: z.record(z.string(), z.any()).optional(),
+    color: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
+    steps: z.number().int().positive().optional(),
+    permission: Permission.optional(),
+  })
 ```
 
-**注意**：`config` hook 接收的 `config` 对象类型是 `Config`，可以直接修改。
+### 19.3 插件扩展方式（动态 Agent 市场）
 
-### 13.3 对比两种方式
-
-| 特性 | 配置文件方式 | 插件扩展方式 |
-|------|-------------|-------------|
-| **开发成本** | 无需开发 | 需要开发插件 |
-| **灵活性** | 静态配置 | 动态加载、可远程获取 |
-| **适用场景** | 个人/团队固定 Agent | Agent 市场、动态更新 |
-| **分发方式** | 分享配置文件 | 分享插件包 |
-| **更新机制** | 手动修改配置 | 插件自动拉取最新列表 |
-
-### 13.4 实现 Agent 市场的完整示例
-
-**服务端 API（提供 Agent 列表）：**
-
-```python
-# FastAPI 示例
-from fastapi import FastAPI
-
-app = FastAPI()
-
-@app.get("/api/agents")
-async def list_agents():
-    return [
-        {
-            "id": "fuyao-coder",
-            "description": "专注于代码编写和优化",
-            "mode": "primary",
-            "model": "anthropic/claude-sonnet-4-20250514",  # 完整的 model ID
-            "systemPrompt": "你是扶摇平台的代码专家...",
-            "permissions": {"*": "allow"},
-            "color": "#4ECDC4",
-            "temperature": 0.5,
-        },
-        {
-            "id": "fuyao-reviewer",
-            "description": "专注于代码审查和质量保障",
-            "mode": "primary",
-            "model": "anthropic/claude-sonnet-4-20250514",
-            "systemPrompt": "你是扶摇平台的代码审查专家...",
-            "permissions": {"read": "allow", "edit": "deny", "bash": "deny"},
-            "color": "#FF6B6B",
-            "temperature": 0.3,
-        },
-    ]
-```
-
-**插件实现（消费 Agent 列表）：**
+通过插件从远程 API 动态加载 Agent 列表，实现真正的"Agent 市场"：
 
 ```typescript
-import type { Plugin, Hooks } from "@opencode-ai/plugin";
-import { tool } from "@opencode-ai/plugin";
+// agent-marketplace-plugin.ts
+import { Plugin, Hooks, tool } from "@opencode-ai/plugin";
 
-const MARKET_API = process.env.AGENT_MARKET_URL || "https://api.fuyao.com";
+interface MarketplaceAgent {
+  id: string;
+  name: string;
+  description: string;
+  model: string;
+  systemPrompt: string;
+  category: string;
+  author: string;
+  downloads: number;
+  rating: number;
+  permissions: Record<string, string>;
+}
 
-const FuyaoAgentMarketPlugin: Plugin = async (ctx): Promise<Hooks> => {
-  let cachedAgents: Record<string, any> = {};
+const AgentMarketplacePlugin: Plugin = async (ctx): Promise<Hooks> => {
+  const MARKETPLACE_API = process.env.AGENT_MARKETPLACE_URL || "https://api.my-marketplace.com";
   
-  // 插件加载时获取 Agent 列表
-  async function fetchAgents() {
+  // 缓存已安装的 Agent
+  let installedAgents: MarketplaceAgent[] = [];
+  
+  // 从远程获取 Agent 列表
+  async function fetchAgents(): Promise<MarketplaceAgent[]> {
     try {
-      const response = await fetch(`${MARKET_API}/api/agents`);
-      const agentList = await response.json();
-      
-      cachedAgents = Object.fromEntries(
-        agentList.map((agent: any) => [
-          agent.id,
-          {
-            description: agent.description,
-            mode: agent.mode || "primary",
-            model: agent.model,
-            prompt: agent.systemPrompt,
-            temperature: agent.temperature,
-            permission: agent.permissions || { "*": "allow" },
-            color: agent.color,
-          },
-        ])
-      );
+      const response = await fetch(`${MARKETPLACE_API}/agents`, {
+        headers: {
+          "Authorization": `Bearer ${process.env.MARKETPLACE_TOKEN}`,
+        },
+      });
+      if (!response.ok) throw new Error("Failed to fetch agents");
+      return response.json();
     } catch (error) {
-      console.error("[FuyaoAgentMarket] Failed to fetch agents:", error);
+      console.error("Failed to fetch marketplace agents:", error);
+      return [];
     }
   }
   
-  await fetchAgents();
-
+  // 获取用户已安装的 Agent
+  async function getInstalledAgents(): Promise<MarketplaceAgent[]> {
+    try {
+      const response = await fetch(`${MARKETPLACE_API}/user/installed`, {
+        headers: {
+          "Authorization": `Bearer ${process.env.MARKETPLACE_TOKEN}`,
+        },
+      });
+      return response.json();
+    } catch {
+      return [];
+    }
+  }
+  
+  // 初始化时加载已安装的 Agent
+  installedAgents = await getInstalledAgents();
+  
   return {
+    // 动态注入 Agent 配置
     config: async (config) => {
-      // 合并到配置中
+      // 将市场 Agent 转换为 OpenCode Agent 配置
+      const marketAgents = installedAgents.reduce((acc, agent) => ({
+        ...acc,
+        [`market-${agent.id}`]: {
+          name: agent.name,
+          description: `[${agent.category}] ${agent.description} (by ${agent.author})`,
+          mode: "primary" as const,
+          model: agent.model,
+          prompt: agent.systemPrompt,
+          permission: agent.permissions,
+        },
+      }), {});
+      
       config.agent = {
         ...config.agent,
-        ...cachedAgents,
+        ...marketAgents,
       };
     },
     
-    // 提供刷新工具（可选）
+    // 提供市场管理工具
     tool: {
-      refresh_fuyao_agents: tool({
-        description: "刷新扶摇 Agent 市场列表",
+      // 浏览市场
+      marketplace_browse: tool({
+        description: "浏览 Agent 市场，查看可用的 Agent",
+        args: {
+          category: tool.schema.string().optional().describe("分类过滤"),
+          search: tool.schema.string().optional().describe("搜索关键词"),
+        },
+        async execute(args, ctx) {
+          const agents = await fetchAgents();
+          let filtered = agents;
+          
+          if (args.category) {
+            filtered = filtered.filter(a => a.category === args.category);
+          }
+          if (args.search) {
+            const search = args.search.toLowerCase();
+            filtered = filtered.filter(a => 
+              a.name.toLowerCase().includes(search) ||
+              a.description.toLowerCase().includes(search)
+            );
+          }
+          
+          return JSON.stringify({
+            total: filtered.length,
+            agents: filtered.map(a => ({
+              id: a.id,
+              name: a.name,
+              description: a.description,
+              category: a.category,
+              author: a.author,
+              rating: a.rating,
+              downloads: a.downloads,
+            })),
+          }, null, 2);
+        },
+      }),
+      
+      // 安装 Agent
+      marketplace_install: tool({
+        description: "从市场安装 Agent",
+        args: {
+          agentId: tool.schema.string().describe("要安装的 Agent ID"),
+        },
+        async execute(args, ctx) {
+          const response = await fetch(`${MARKETPLACE_API}/agents/${args.agentId}/install`, {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${process.env.MARKETPLACE_TOKEN}`,
+            },
+          });
+          
+          if (!response.ok) {
+            return `安装失败: ${await response.text()}`;
+          }
+          
+          const agent = await response.json();
+          installedAgents.push(agent);
+          
+          return `Agent "${agent.name}" 安装成功！使用 @market-${agent.id} 来调用。`;
+        },
+      }),
+      
+      // 卸载 Agent
+      marketplace_uninstall: tool({
+        description: "卸载已安装的 Agent",
+        args: {
+          agentId: tool.schema.string().describe("要卸载的 Agent ID"),
+        },
+        async execute(args, ctx) {
+          const response = await fetch(`${MARKETPLACE_API}/agents/${args.agentId}/uninstall`, {
+            method: "POST",
+            headers: {
+              "Authorization": `Bearer ${process.env.MARKETPLACE_TOKEN}`,
+            },
+          });
+          
+          if (!response.ok) {
+            return `卸载失败: ${await response.text()}`;
+          }
+          
+          installedAgents = installedAgents.filter(a => a.id !== args.agentId);
+          return `Agent 已卸载。重启 OpenCode 后生效。`;
+        },
+      }),
+      
+      // 列出已安装
+      marketplace_list: tool({
+        description: "列出已安装的市场 Agent",
         args: {},
-        async execute(_args, _ctx) {
-          await fetchAgents();
-          return `已刷新 ${Object.keys(cachedAgents).length} 个 Agent`;
+        async execute(args, ctx) {
+          return JSON.stringify({
+            installed: installedAgents.map(a => ({
+              id: `market-${a.id}`,
+              name: a.name,
+              category: a.category,
+            })),
+          }, null, 2);
         },
       }),
     },
+    
+    // 消息处理：检测市场相关命令
+    "chat.message": async (input, output) => {
+      const content = input.content.toLowerCase();
+      
+      if (content.includes("@marketplace") || content.includes("@市场")) {
+        output.metadata = {
+          ...output.metadata,
+          hint: "使用 marketplace_browse 工具浏览市场，marketplace_install 安装 Agent",
+        };
+      }
+    },
   };
 };
 
-export default FuyaoAgentMarketPlugin;
+export default AgentMarketplacePlugin;
 ```
 
-### 13.5 Agent 权限配置
+### 19.4 两种方式对比
 
-**文件位置**: `opencode-dev/packages/opencode/src/config/config.ts`
+| 特性 | 直接配置 | 插件扩展 |
+|------|---------|---------|
+| **动态更新** | 需重启 | 运行时更新 |
+| **远程加载** | 不支持 | 支持 |
+| **用户交互** | 无 | 可提供安装/卸载工具 |
+| **配置复杂度** | 低 | 中等 |
+| **适用场景** | 企业预设 Agent | 公开 Agent 市场 |
 
-```typescript
-// 权限值类型
-type PermissionAction = "ask" | "allow" | "deny"
+### 19.5 混合方案
 
-// 权限规则可以是简单值或嵌套对象
-type PermissionRule = PermissionAction | Record<string, PermissionAction>
-
-// 完整的权限配置 Schema
-const Permission = z.object({
-  read: PermissionRule.optional(),        // 读取文件
-  edit: PermissionRule.optional(),        // 编辑文件
-  glob: PermissionRule.optional(),        // glob 搜索
-  grep: PermissionRule.optional(),        // grep 搜索
-  list: PermissionRule.optional(),        // 列出目录
-  bash: PermissionRule.optional(),        // 执行 bash 命令
-  task: PermissionRule.optional(),        // 创建子任务
-  external_directory: PermissionRule.optional(),  // 访问外部目录
-  todowrite: PermissionAction.optional(), // 写入 TODO
-  todoread: PermissionAction.optional(),  // 读取 TODO
-  question: PermissionAction.optional(),  // 提问用户
-  webfetch: PermissionAction.optional(),  // 获取网页
-  websearch: PermissionAction.optional(), // 网络搜索
-  codesearch: PermissionAction.optional(), // 代码搜索
-  lsp: PermissionRule.optional(),         // LSP 功能
-  doom_loop: PermissionAction.optional(), // 防止死循环
-  skill: PermissionRule.optional(),       // Skill 工具
-}).catchall(PermissionRule)  // 支持自定义权限
-```
-
-**配置示例**：
+结合两种方式，实现基础 Agent + 市场扩展：
 
 ```jsonc
+// opencode.jsonc - 基础 Agent
 {
   "agent": {
-    "my-agent": {
-      "permission": {
-        // 简单配置
-        "*": "allow",           // 默认允许所有
-        "bash": "ask",          // bash 需要询问
-        "edit": "deny",         // 禁止编辑
-        
-        // 嵌套配置（按文件模式）
-        "read": {
-          "*": "allow",
-          "*.env": "ask",       // .env 文件需要询问
-          "*.env.*": "ask"
-        },
-        
-        // 外部目录访问
-        "external_directory": {
-          "*": "ask",
-          "/tmp/*": "allow"     // /tmp 目录允许访问
-        }
-      }
+    "build": { /* 默认保留 */ },
+    "plan": { /* 默认保留 */ },
+    "company-agent": {
+      "description": "公司内部专用 Agent",
+      "prompt": "你是公司内部的代码助手，熟悉公司的代码规范和技术栈。请遵循公司的编码标准进行开发。",
+      "mode": "primary"
     }
-  }
+  },
+  "plugin": [
+    "agent-marketplace-plugin"  // 插件动态加载市场 Agent
+  ]
 }
 ```
 
-**Agent 模式说明**：
-
-| 模式 | 说明 |
-|------|------|
-| `primary` | 主 Agent，可以直接选择使用 |
-| `subagent` | 子 Agent，只能被其他 Agent 调用 |
-| `all` | 两种模式都支持 |
-
 ---
 
-## 十四、关键代码文件索引（补充）
-
-| 文件 | 说明 |
-|------|------|
-| `opencode-dev/packages/plugin/src/index.ts` | **Plugin、Hooks、AuthHook 类型定义** |
-| `opencode-dev/packages/plugin/src/tool.ts` | Tool 定义和 ToolContext |
-| `opencode-dev/packages/opencode/src/config/config.ts` | **配置 Schema（Agent、Provider、Permission 等）** |
-| `opencode-dev/packages/opencode/src/agent/agent.ts` | **Agent 运行时定义和内置 Agent** |
-| `opencode-dev/packages/opencode/src/provider/provider.ts` | Provider 核心实现和 SDK 集成 |
-| `opencode-dev/packages/opencode/src/provider/models.ts` | models.dev 模型目录定义 |
-| `opencode-dev/packages/opencode/src/tool/codesearch.ts` | CodeSearch 工具（Exa API） |
-| `opencode-dev/packages/opencode/src/tool/registry.ts` | 工具注册表 |
-| `opencode-dev/packages/opencode/src/plugin/index.ts` | 插件加载和 trigger 机制 |
-
----
-
-## 十五、总结
-
-### 扩展方式与源码修改位置
+## 20. 源码修改位置汇总
 
 | 扩展点 | 无需修改源码 | 需修改源码 |
 |--------|------------|----------|
-| **用户账号认证（云端）** | - | `packages/console/function/src/auth.ts` |
-| **本地服务认证** | 环境变量 `OPENCODE_SERVER_PASSWORD` | `packages/opencode/src/server/server.ts` |
+| **用户账号认证** | - | `packages/console/function/src/auth.ts` |
+| **本地服务认证** | 环境变量 | `packages/opencode/src/server/server.ts` |
 | **Provider 认证** | 插件 `auth` hook | - |
 | **新增 Provider SDK** | - | `packages/opencode/src/provider/provider.ts` |
-| **Provider 配置** | `opencode.jsonc` / 插件 `config` hook | - |
+| **Provider 配置** | 配置文件 / 插件 `config` hook | - |
+| **自定义推理服务** | 环境变量 / 配置文件 / 插件 `config` hook | `packages/opencode/src/provider/provider.ts`（新 SDK） |
+| **模型数据源** | 环境变量 `OPENCODE_MODELS_URL` | `packages/opencode/src/provider/models.ts` |
 | **自定义工具** | 插件 `tool` hook | - |
 | **修改内置工具** | - | `packages/opencode/src/tool/` |
-| **Agent 配置** | `opencode.jsonc` / 插件 `config` hook | - |
+| **Codebase 搜索** | 插件 `tool` hook / MCP | `packages/opencode/src/tool/codesearch.ts` |
+| **Agent 配置** | 配置文件 / 插件 `config` hook | - |
+| **Agent 市场** | 配置文件 / 插件 `config` hook | - |
 | **修改内置 Agent** | - | `packages/opencode/src/agent/agent.ts` |
-| **MCP 接入** | `opencode.jsonc` mcp 配置 | - |
+| **MCP 接入** | 配置文件 / 插件 `config` hook | - |
 | **事件监听** | 插件 `event` hook | - |
 | **拦截工具执行** | 插件 `tool.execute.before/after` hook | - |
 
-### 关键源码文件索引
+---
 
-| 功能 | 源码文件 |
-|------|---------|
-| **插件类型定义** | `packages/plugin/src/index.ts` |
-| **用户认证（云端）** | `packages/console/function/src/auth.ts` |
-| **用户认证（数据库）** | `packages/console/core/src/schema/auth.sql.ts` |
-| **本地服务 Server** | `packages/opencode/src/server/server.ts` |
-| **Provider 认证存储** | `packages/opencode/src/auth/index.ts` |
-| **Provider 核心实现** | `packages/opencode/src/provider/provider.ts` |
-| **配置 Schema** | `packages/opencode/src/config/config.ts` |
-| **Agent 定义** | `packages/opencode/src/agent/agent.ts` |
-| **工具注册** | `packages/opencode/src/tool/registry.ts` |
-| **CodeSearch 工具** | `packages/opencode/src/tool/codesearch.ts` |
-| **插件加载** | `packages/opencode/src/plugin/index.ts` |
+## 21. 关键源码文件索引
 
-### 重要说明
-
-1. **Provider 限制**：OpenCode 的 Provider 体系基于 AI SDK，无法通过插件动态注册全新的 Provider SDK。如需添加新 SDK，必须修改 `packages/opencode/src/provider/provider.ts` 中的 `BUNDLED_PROVIDERS`。
-
-2. **用户账号认证**：用户登录认证由 Console 云端服务处理，使用 OpenAuth 框架。如需自定义（如企业 SSO），需修改 `packages/console/function/src/auth.ts`。
-
-3. **本地服务认证**：OpenCode 本地服务仅支持 Basic Auth，通过环境变量配置。如需更复杂的认证（如 JWT），需修改 `packages/opencode/src/server/server.ts`。
-
-4. **CodeSearch 说明**：内置的 `codesearch` 工具是用于搜索**外部**代码库和文档（通过 Exa API），不是搜索本地项目。
-
-### 推荐方案
-
-| 场景 | 推荐方式 |
-|------|---------|
-| 配置已有 Provider | 配置文件 + 环境变量 |
-| 添加自定义 Agent | 配置文件 或 插件 `config` hook |
-| 添加自定义工具 | 插件 `tool` hook |
-| 接入外部服务 | MCP Server + `mcp` 配置 |
-| Provider 认证流程 | 插件 `auth` hook |
-| 监听系统事件 | 插件 `event` hook |
-| 拦截工具执行 | 插件 `tool.execute.before/after` hook |
-| 用户账号认证 | **修改源码** `packages/console/` |
-| 添加新 Provider SDK | **修改源码** `packages/opencode/src/provider/` |
+| 功能 | 源码文件 | 说明 |
+|------|---------|------|
+| **插件类型定义** | `packages/plugin/src/index.ts` | Plugin、Hooks、AuthHook 类型 |
+| **插件加载机制** | `packages/opencode/src/plugin/index.ts` | 加载和触发插件 |
+| **配置 Schema** | `packages/opencode/src/config/config.ts` | Agent、Provider、MCP 等配置定义 |
+| **Session 管理** | `packages/opencode/src/session/` | 会话、消息持久化 |
+| **Agent 定义** | `packages/opencode/src/agent/agent.ts` | 内置 Agent 和配置合并逻辑 |
+| **Provider 实现** | `packages/opencode/src/provider/provider.ts` | LLM SDK 加载和模型获取 |
+| **模型数据** | `packages/opencode/src/provider/models.ts` | models.dev 数据获取和缓存 |
+| **代码搜索** | `packages/opencode/src/tool/codesearch.ts` | 外部代码/文档搜索（Exa API） |
+| **工具注册** | `packages/opencode/src/tool/registry.ts` | 内置工具列表 |
+| **Tool 定义** | `packages/opencode/src/tool/tool.ts` | Tool.define 函数 |
+| **HTTP Server** | `packages/opencode/src/server/server.ts` | Hono 服务器和认证中间件 |
+| **事件系统** | `packages/opencode/src/bus/` | 事件发布订阅 |
+| **本地认证存储** | `packages/opencode/src/auth/index.ts` | auth.json 管理 |
+| **云端认证服务** | `packages/console/function/src/auth.ts` | OpenAuth GitHub/Google OAuth |
+| **数据库 Schema** | `packages/console/core/src/schema/` | MySQL 表定义（Drizzle ORM） |
+| **MCP 配置类型** | `packages/opencode/src/config/config.ts` 第 755-830 行 | Mcp Schema 定义 |
